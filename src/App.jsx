@@ -184,6 +184,7 @@ function loadStore() {
       if (parsed.settings.accessCode === undefined) parsed.settings.accessCode = "";
       if (parsed.settings.deviceUnlocked === undefined) parsed.settings.deviceUnlocked = false;
       if (parsed.settings.syncUrl === undefined) parsed.settings.syncUrl = "";
+      if (parsed.settings.googleClientId === undefined) parsed.settings.googleClientId = "";
       ["tyler", "gracie"].forEach((k) => {
         if (parsed[k] && parsed[k].headerPreset === undefined) parsed[k].headerPreset = "solid";
         if (parsed[k] && parsed[k].headerBg === undefined) parsed[k].headerBg = null;
@@ -198,7 +199,7 @@ function loadStore() {
       return parsed;
     }
   } catch (e) {}
-  const initial = { settings: { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "" } };
+  const initial = { settings: { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "" } };
   ["tyler", "gracie"].forEach((k) => {
     initial[k] = {
       events: SEED_EVENTS[k],
@@ -222,28 +223,93 @@ function saveStore(store) {
   } catch (e) {}
 }
 
+/* ---------- Google auth session (sessionStorage only — clears when the
+   browser tab/session ends, so signing in doesn't linger forever) ---------- */
+const AUTH_SESSION_KEY = "senior_hub_google_auth";
+
+function loadGoogleAuthSession() {
+  try {
+    const raw = sessionStorage.getItem(AUTH_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed.exp || parsed.exp * 1000 < Date.now()) return null; // expired
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveGoogleAuthSession(auth) {
+  try {
+    sessionStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(auth));
+  } catch (e) {}
+}
+
+function clearGoogleAuthSession() {
+  try {
+    sessionStorage.removeItem(AUTH_SESSION_KEY);
+  } catch (e) {}
+}
+
 /* ---------- shared sync (Google Drive via Apps Script Web App) ----------
    syncUrl points to a small Apps Script Web App that reads/writes a single
    JSON file in the family's Google Drive. See google-apps-script/Code.gs
    and the README for setup. This is whole-store, last-write-wins sync —
    fine for casual family use, not built for simultaneous multi-editor
-   conflict resolution. */
-async function fetchRemoteStore(url) {
-  const res = await fetch(url, { method: "GET", cache: "no-store" });
+   conflict resolution.
+
+   If Google Sign-In is configured, every request carries the signed-in
+   user's Google ID token, and the Apps Script itself verifies it (and
+   checks the email against its allow-list) before returning or saving
+   anything — the gate isn't just cosmetic on the front end. */
+async function fetchRemoteStore(url, token) {
+  const sep = url.includes("?") ? "&" : "?";
+  const fetchUrl = token ? `${url}${sep}token=${encodeURIComponent(token)}` : url;
+  const res = await fetch(fetchUrl, { method: "GET", cache: "no-store" });
   if (!res.ok) throw new Error("Sync fetch failed: " + res.status);
-  return res.json();
+  const data = await res.json();
+  if (data && data.ok === false) {
+    const err = new Error(data.error || "Unauthorized");
+    err.unauthorized = data.error === "Unauthorized";
+    throw err;
+  }
+  return data;
 }
 
-async function pushRemoteStore(url, store) {
+async function pushRemoteStore(url, store, token) {
   // text/plain avoids a CORS preflight against the Apps Script endpoint;
   // the script itself parses the body as JSON.
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(store),
+    body: JSON.stringify({ token: token || null, data: store }),
   });
   if (!res.ok) throw new Error("Sync push failed: " + res.status);
-  return res.json();
+  const data = await res.json();
+  if (data && data.ok === false) {
+    const err = new Error(data.error || "Unauthorized");
+    err.unauthorized = data.error === "Unauthorized";
+    throw err;
+  }
+  return data;
+}
+
+/* Decodes (does NOT verify) a JWT payload — fine for reading display info
+   like name/email/picture client-side. Verification of the signature and
+   allow-list happens server-side in the Apps Script for every sync call. */
+function parseJwt(token) {
+  try {
+    const base64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
 }
 
 /* ---------- utility ---------- */
@@ -349,64 +415,74 @@ export default function SeniorYearHub() {
   const [familyView, setFamilyView] = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
   const [lastSynced, setLastSynced] = useState(null);
+  const [googleAuth, setGoogleAuth] = useState(loadGoogleAuthSession); // { token, email, name, picture, exp }
   const hasLoadedRemoteRef = useRef(false);
   const pushTimeoutRef = useRef(null);
   const syncUrl = (store.settings && store.settings.syncUrl) || "";
+  const googleClientId = (store.settings && store.settings.googleClientId) || "";
+  const needsGoogleAuth = !!googleClientId && !!syncUrl && !googleAuth;
+  const authToken = googleClientId ? (googleAuth && googleAuth.token) : null;
 
   useEffect(() => {
     saveStore(store);
   }, [store]);
 
-  // Pull the shared copy whenever the sync URL is set (or changes).
+  // Pull the shared copy whenever the sync URL/token changes.
   useEffect(() => {
-    if (!syncUrl) {
-      hasLoadedRemoteRef.current = true;
-      setSyncStatus("idle");
+    if (!syncUrl || needsGoogleAuth) {
+      hasLoadedRemoteRef.current = !syncUrl;
+      if (!syncUrl) setSyncStatus("idle");
       return;
     }
     let cancelled = false;
     hasLoadedRemoteRef.current = false;
     setSyncStatus("syncing");
-    fetchRemoteStore(syncUrl)
+    fetchRemoteStore(syncUrl, authToken)
       .then((remote) => {
         if (cancelled) return;
         if (remote && (remote.tyler || remote.gracie)) {
           setStore((prev) => ({
             ...remote,
-            settings: { ...(remote.settings || {}), syncUrl: prev.settings.syncUrl },
+            settings: { ...(remote.settings || {}), syncUrl: prev.settings.syncUrl, googleClientId: prev.settings.googleClientId },
           }));
         }
         hasLoadedRemoteRef.current = true;
         setSyncStatus("synced");
         setLastSynced(new Date());
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
         hasLoadedRemoteRef.current = true;
         setSyncStatus("error");
+        // A stale/expired Google token — drop it so the sign-in gate reappears.
+        if (err.unauthorized && googleClientId) handleSignOut();
       });
     return () => {
       cancelled = true;
     };
-  }, [syncUrl]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncUrl, authToken, needsGoogleAuth]);
 
   // Push local changes to the shared copy, debounced so rapid edits don't
   // fire a request per keystroke.
   useEffect(() => {
-    if (!syncUrl || !hasLoadedRemoteRef.current) return;
+    if (!syncUrl || needsGoogleAuth || !hasLoadedRemoteRef.current) return;
     if (pushTimeoutRef.current) clearTimeout(pushTimeoutRef.current);
     pushTimeoutRef.current = setTimeout(() => {
       setSyncStatus("syncing");
-      pushRemoteStore(syncUrl, store)
+      pushRemoteStore(syncUrl, store, authToken)
         .then(() => {
           setSyncStatus("synced");
           setLastSynced(new Date());
         })
-        .catch(() => setSyncStatus("error"));
+        .catch((err) => {
+          setSyncStatus("error");
+          if (err.unauthorized && googleClientId) handleSignOut();
+        });
     }, 1500);
     return () => clearTimeout(pushTimeoutRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store, syncUrl]);
+  }, [store, syncUrl, authToken, needsGoogleAuth]);
 
   const isOverview = activeKid === "overview";
   const theme = isOverview ? null : THEMES[activeKid];
@@ -438,10 +514,30 @@ export default function SeniorYearHub() {
     }));
   }
 
-  const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "" };
-  const needsUnlock = !!settings.accessCode && !settings.deviceUnlocked;
+  function handleAuthed(auth) {
+    saveGoogleAuthSession(auth);
+    setGoogleAuth(auth);
+  }
 
-  if (needsUnlock) {
+  function handleSignOut() {
+    clearGoogleAuthSession();
+    setGoogleAuth(null);
+  }
+
+  const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "" };
+  const needsPasscode = !googleClientId && !!settings.accessCode && !settings.deviceUnlocked;
+
+  if (needsGoogleAuth) {
+    return (
+      <GoogleSignInGate
+        clientId={googleClientId}
+        syncUrl={syncUrl}
+        onAuthed={handleAuthed}
+      />
+    );
+  }
+
+  if (needsPasscode) {
     return (
       <AccessGate
         accessCode={settings.accessCode}
@@ -470,6 +566,8 @@ export default function SeniorYearHub() {
         familyView={familyView}
         setFamilyView={setFamilyView}
         syncStatus={syncStatus}
+        googleAuth={googleAuth}
+        onSignOut={handleSignOut}
       />
 
       {isOverview ? (
@@ -515,6 +613,8 @@ export default function SeniorYearHub() {
           onClose={() => setShowReminders(false)}
           syncStatus={syncStatus}
           lastSynced={lastSynced}
+          googleAuth={googleAuth}
+          onSignOut={handleSignOut}
         />
       )}
     </div>
@@ -612,6 +712,133 @@ function AccessGate({ accessCode, onUnlock }) {
 }
 
 /* ============================================================
+   GOOGLE SIGN-IN GATE — real, server-verified auth.
+   Renders Google's own Sign-In button (Google Identity Services, loaded
+   via the <script> tag in index.html), then hands the resulting ID token
+   to the Apps Script sync endpoint, which verifies it and checks the
+   caller's email against its own allow-list before returning anything.
+   A rejected/invalid token never gets past that server-side check, even
+   if someone bypassed this screen entirely.
+   ============================================================ */
+function GoogleSignInGate({ clientId, syncUrl, onAuthed }) {
+  const buttonRef = useRef(null);
+  const [ready, setReady] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    function tryInit() {
+      if (cancelled) return;
+      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+        setTimeout(tryInit, 200);
+        return;
+      }
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: handleCredential,
+        auto_select: true,
+      });
+      if (buttonRef.current) {
+        window.google.accounts.id.renderButton(buttonRef.current, {
+          theme: "outline",
+          size: "large",
+          width: 280,
+        });
+      }
+      setReady(true);
+    }
+    tryInit();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId]);
+
+  function handleCredential(response) {
+    const token = response.credential;
+    const info = parseJwt(token);
+    setVerifying(true);
+    setError("");
+    // The real check: ask the Apps Script to accept this token. If the
+    // caller's email isn't on its allow-list, this fails and we never let
+    // them in, regardless of what the front end thinks.
+    fetchRemoteStore(syncUrl, token)
+      .then(() => {
+        onAuthed({
+          token,
+          email: info && info.email,
+          name: info && info.name,
+          picture: info && info.picture,
+          exp: info && info.exp,
+        });
+      })
+      .catch((err) => {
+        setVerifying(false);
+        if (err.unauthorized) {
+          setError(
+            (info && info.email ? info.email : "That Google account") +
+              " isn't on the family list yet. Ask whoever manages this hub to add that exact " +
+              "email address, then click the sign-in button again — or click it again now to " +
+              "pick a different Google account."
+          );
+        } else {
+          setError("Couldn't reach the sync service to verify — check your connection and try again.");
+        }
+      });
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "linear-gradient(135deg, #2B2B2B, #4B2E83)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+        boxSizing: "border-box",
+        fontFamily: "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
+      }}
+    >
+      <div
+        style={{
+          background: "#fff",
+          borderRadius: 16,
+          padding: 28,
+          width: "100%",
+          maxWidth: 360,
+          boxSizing: "border-box",
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 30, marginBottom: 6 }}>🔒</div>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
+        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
+          This family hub is private. Sign in with your own Google account —
+          nothing to set up, no new password. If your email's been added to
+          the family list, you're straight in.
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "center", minHeight: 44, marginBottom: 14 }}>
+          <div ref={buttonRef} />
+          {!ready && (
+            <div style={{ fontSize: 12.5, color: "#A19DAF", alignSelf: "center" }}>Loading sign-in…</div>
+          )}
+        </div>
+
+        {verifying && (
+          <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 10 }}>Checking your account…</div>
+        )}
+        {error && (
+          <div style={{ fontSize: 12.5, color: "#B33A3A", fontWeight: 600, lineHeight: 1.5 }}>{error}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    KID SWITCHER — the signature element: a two-tab "ID badge" rail
    ============================================================ */
 const OVERVIEW_BAR = {
@@ -622,7 +849,7 @@ const OVERVIEW_BAR = {
   onPrimary: "#FFFFFF",
 };
 
-function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, setFamilyView, syncStatus }) {
+function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, setFamilyView, syncStatus, googleAuth, onSignOut }) {
   const options = [OVERVIEW_BAR, ...Object.values(THEMES)];
   return (
     <>
@@ -720,6 +947,34 @@ function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, set
           >
             {syncStatus === "syncing" ? "🔄" : syncStatus === "synced" ? "🟢" : "🔴"}
           </span>
+        )}
+        {googleAuth && (
+          <button
+            onClick={() => {
+              if (window.confirm("Sign out of " + (googleAuth.email || "this account") + "?")) {
+                onSignOut();
+              }
+            }}
+            title={"Signed in as " + (googleAuth.email || "")}
+            style={{
+              border: "none",
+              cursor: "pointer",
+              background: "#1A1A1A",
+              padding: "0 8px",
+              display: "flex",
+              alignItems: "center",
+            }}
+          >
+            {googleAuth.picture ? (
+              <img
+                src={googleAuth.picture}
+                alt=""
+                style={{ width: 20, height: 20, borderRadius: "50%", display: "block" }}
+              />
+            ) : (
+              <span style={{ fontSize: 14 }}>👤</span>
+            )}
+          </button>
         )}
         <button
           onClick={onOpenReminders}
@@ -3648,11 +3903,12 @@ function BottomNav({ theme, tab, setTab }) {
    REMINDERS SETTINGS — manage phone numbers used for text reminders
    Shared across both kids since it's the same parents.
    ============================================================ */
-function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced }) {
+function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut }) {
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const [codeInput, setCodeInput] = useState(settings.accessCode || "");
   const [syncInput, setSyncInput] = useState(settings.syncUrl || "");
+  const [clientIdInput, setClientIdInput] = useState(settings.googleClientId || "");
   const phoneNumbers = settings.phoneNumbers || [];
 
   function addNumber() {
@@ -3692,6 +3948,15 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
     updateSettings((s) => ({ ...s, syncUrl: "" }));
   }
 
+  function saveClientId() {
+    updateSettings((s) => ({ ...s, googleClientId: clientIdInput.trim() }));
+  }
+
+  function clearClientId() {
+    setClientIdInput("");
+    updateSettings((s) => ({ ...s, googleClientId: "" }));
+  }
+
   return (
     <div
       style={{
@@ -3721,11 +3986,141 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
           boxSizing: "border-box",
         }}
       >
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>👤 Google Sign-In (real auth)</div>
+        <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
+          Requires Shared sync to be turned on below — this replaces the passcode
+          gate with real Google sign-in, verified by the same Apps Script that
+          runs your sync. Setup steps (Google Cloud Console + editing the
+          allow-list in your script) are in the README.
+        </div>
+
+        {googleAuth && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              border: "1px solid #EDEAF3",
+              borderRadius: 9,
+              padding: "9px 12px",
+              marginBottom: 14,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {googleAuth.picture ? (
+                <img src={googleAuth.picture} alt="" style={{ width: 26, height: 26, borderRadius: "50%" }} />
+              ) : (
+                <span style={{ fontSize: 18 }}>👤</span>
+              )}
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 700 }}>Signed in</div>
+                <div style={{ fontSize: 11.5, color: "#8A8494" }}>{googleAuth.email}</div>
+              </div>
+            </div>
+            <button
+              onClick={onSignOut}
+              style={{
+                background: "transparent",
+                border: "1px solid #E0DCE8",
+                borderRadius: 7,
+                padding: "6px 12px",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+                color: "#8A2E2E",
+              }}
+            >
+              Sign out
+            </button>
+          </div>
+        )}
+
+        <input
+          type="text"
+          value={clientIdInput}
+          onChange={(e) => setClientIdInput(e.target.value)}
+          placeholder="xxxxxxxx.apps.googleusercontent.com"
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            border: "1.5px solid #E7E1F5",
+            borderRadius: 8,
+            padding: "10px 12px",
+            fontSize: 13,
+            marginBottom: 10,
+            fontFamily: "inherit",
+          }}
+        />
+        <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+          <button
+            onClick={saveClientId}
+            disabled={!clientIdInput.trim() || clientIdInput.trim() === settings.googleClientId}
+            style={{
+              flex: 1,
+              background: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "#4B2E83" : "#E7E1F5",
+              color: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "#fff" : "#A8A2BC",
+              border: "none",
+              borderRadius: 9,
+              padding: "10px 0",
+              fontWeight: 800,
+              fontSize: 13.5,
+              cursor: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "pointer" : "not-allowed",
+            }}
+          >
+            Save
+          </button>
+          {settings.googleClientId && (
+            <button
+              onClick={clearClientId}
+              style={{
+                flex: 1,
+                background: "transparent",
+                border: "1.5px solid #E0DCE8",
+                borderRadius: 9,
+                padding: "10px 0",
+                fontWeight: 700,
+                fontSize: 13.5,
+                cursor: "pointer",
+                color: "#8A2E2E",
+              }}
+            >
+              Turn off
+            </button>
+          )}
+        </div>
+        <div
+          style={{
+            background: "#F7F5FB",
+            border: "1px solid #E7E1F5",
+            borderRadius: 10,
+            padding: "10px 12px",
+            fontSize: 11.5,
+            color: "#5A5468",
+            marginBottom: 22,
+            lineHeight: 1.5,
+          }}
+        >
+          ⓘ The actual allow-list (which Google accounts get in) lives in your
+          Apps Script's <code>ALLOWED_EMAILS</code> list, not here — that's what
+          makes this real security instead of a client-side-only check. Editing
+          it here would defeat the point, so we don't offer that here on
+          purpose.
+        </div>
+
+        <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
+
         <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>🔒 Family access code</div>
         <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
           Set a shared code so only people you give it to can open this hub. Once someone enters
           it right, their device stays unlocked until you lock it again or they clear their
           browser data.
+          {settings.googleClientId && (
+            <>
+              {" "}
+              <strong>Google Sign-In above is turned on, so it takes over from this passcode
+              gate</strong> for anyone who has it configured.
+            </>
+          )}
         </div>
         <input
           type="text"
