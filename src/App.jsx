@@ -1,6 +1,19 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 
 /* ============================================================
+   APP CONFIG — fill these in once and every visitor gets sync +
+   Google Sign-In automatically, no per-device setup needed.
+   - syncUrl: your deployed Apps Script Web App URL (ends in /exec)
+   - googleClientId: your OAuth Client ID (ends in .apps.googleusercontent.com)
+   Leave either blank to keep that feature off by default — people can
+   still turn it on manually per-device via Settings, same as before.
+   ============================================================ */
+const APP_CONFIG = {
+  syncUrl: "https://script.google.com/macros/s/AKfycbwtNfd2kgsrWCl9SH3b8k2x8rOgAexDgv8QrFAdX5KrXk5OBrM5lgXog7uHVsLdWFJWmg/exec",
+  googleClientId: "845495850293-2vs464h543k1mdgke0oq6iig3pjqc4qt.apps.googleusercontent.com",
+};
+
+/* ============================================================
    SENIOR YEAR HUB — two-kid edition
    Tyler @ Hutto High School (Hippos) — orange / white
    Gracie @ Cedar Ridge High School (Raiders) — purple / black / silver
@@ -183,8 +196,8 @@ function loadStore() {
       if (!parsed.settings) parsed.settings = { phoneNumbers: [] };
       if (parsed.settings.accessCode === undefined) parsed.settings.accessCode = "";
       if (parsed.settings.deviceUnlocked === undefined) parsed.settings.deviceUnlocked = false;
-      if (parsed.settings.syncUrl === undefined) parsed.settings.syncUrl = "";
-      if (parsed.settings.googleClientId === undefined) parsed.settings.googleClientId = "";
+      if (parsed.settings.syncUrl === undefined) parsed.settings.syncUrl = APP_CONFIG.syncUrl;
+      if (parsed.settings.googleClientId === undefined) parsed.settings.googleClientId = APP_CONFIG.googleClientId;
       ["tyler", "gracie"].forEach((k) => {
         if (parsed[k] && parsed[k].headerPreset === undefined) parsed[k].headerPreset = "solid";
         if (parsed[k] && parsed[k].headerBg === undefined) parsed[k].headerBg = null;
@@ -199,7 +212,15 @@ function loadStore() {
       return parsed;
     }
   } catch (e) {}
-  const initial = { settings: { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "" } };
+  const initial = {
+    settings: {
+      phoneNumbers: [],
+      accessCode: "",
+      deviceUnlocked: false,
+      syncUrl: APP_CONFIG.syncUrl,
+      googleClientId: APP_CONFIG.googleClientId,
+    },
+  };
   ["tyler", "gracie"].forEach((k) => {
     initial[k] = {
       events: SEED_EVENTS[k],
@@ -590,10 +611,11 @@ export default function SeniorYearHub() {
                 settings={store.settings || { phoneNumbers: [] }}
                 onOpenReminders={() => setShowReminders(true)}
                 familyView={familyView}
+                currentUser={googleAuth}
               />
             )}
             {tab === "gallery" && (
-              <GalleryTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
+              <GalleryTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} currentUser={googleAuth} />
             )}
             {tab === "party" && (
               <PartyTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
@@ -1687,7 +1709,7 @@ function PartySummary({ theme, data }) {
 /* ============================================================
    EVENTS TAB
    ============================================================ */
-function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyView }) {
+function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyView, currentUser }) {
   const [filter, setFilter] = useState("All");
   const [view, setView] = useState("list"); // "list" | "calendar"
   const [showAdd, setShowAdd] = useState(false);
@@ -1712,7 +1734,8 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
   }, [filteredEvents]);
 
   function addEvent(newEvent) {
-    updateKid((d) => ({ ...d, events: [...d.events, newEvent] }));
+    const addedBy = currentUser ? currentUser.name || currentUser.email : null;
+    updateKid((d) => ({ ...d, events: [...d.events, { ...newEvent, addedBy }] }));
     setShowAdd(false);
   }
 
@@ -1836,6 +1859,11 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
                       {e.reminder && e.reminder.enabled && (
                         <div style={{ fontSize: 11.5, color: theme.primary, fontWeight: 700, marginTop: 3 }}>
                           📱 Reminder set
+                        </div>
+                      )}
+                      {e.addedBy && (
+                        <div style={{ fontSize: 11, color: theme.subtext, marginTop: 2, fontStyle: "italic" }}>
+                          Added by {e.addedBy}
                         </div>
                       )}
                     </div>
@@ -2616,7 +2644,7 @@ function inputStyle(theme) {
 /* ============================================================
    GALLERY TAB
    ============================================================ */
-function GalleryTab({ theme, data, updateKid, familyView }) {
+function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
   const [slideshow, setSlideshow] = useState(false);
   const [slideshowPhotos, setSlideshowPhotos] = useState(null); // null = use approved(filtered)
   const [slideIdx, setSlideIdx] = useState(0);
@@ -2636,9 +2664,10 @@ function GalleryTab({ theme, data, updateKid, familyView }) {
   const selectedPhotos = approvedAll.filter((p) => selectedIds.includes(p.id));
 
   function approve(id) {
+    const approvedBy = currentUser ? currentUser.name || currentUser.email : null;
     updateKid((d) => ({
       ...d,
-      photos: d.photos.map((p) => (p.id === id ? { ...p, approved: true } : p)),
+      photos: d.photos.map((p) => (p.id === id ? { ...p, approved: true, approvedBy } : p)),
     }));
   }
   function reject(id) {
@@ -3178,6 +3207,11 @@ function PhotoDetailModal({ theme, photo, onClose, onToggleTag, onDelete, family
         <div style={{ padding: 16 }}>
           {photo.caption && (
             <div style={{ fontSize: 13.5, color: "#565064", marginBottom: 12 }}>{photo.caption}</div>
+          )}
+          {photo.approvedBy && (
+            <div style={{ fontSize: 11.5, color: "#A19DAF", fontStyle: "italic", marginBottom: 12 }}>
+              Approved by {photo.approvedBy}
+            </div>
           )}
 
           {confirmingDelete ? (
@@ -3988,10 +4022,11 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
       >
         <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>👤 Google Sign-In (real auth)</div>
         <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-          Requires Shared sync to be turned on below — this replaces the passcode
-          gate with real Google sign-in, verified by the same Apps Script that
-          runs your sync. Setup steps (Google Cloud Console + editing the
-          allow-list in your script) are in the README.
+          This is normally pre-configured for the whole family (baked into the site itself, same
+          as the sync URL below) — every visitor should already see the sign-in screen without
+          anyone needing to paste anything in here. This field is mainly for troubleshooting.
+          Requires Shared sync to be on. The real access control — who's allowed in — lives in
+          your Apps Script's allow-list, not here (see the README).
         </div>
 
         {googleAuth && (
@@ -4217,9 +4252,9 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
 
         <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>🔄 Shared sync (Google Drive)</div>
         <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-          Paste in the Web App URL from the Apps Script setup (see the README) to sync events,
-          photos, and everything else across every family member's device through a JSON file in
-          your Google Drive.
+          This is normally pre-configured for the whole family (baked into the site itself), so
+          you shouldn't need to touch it. This field is here mainly for troubleshooting or
+          pointing this one device at a different sync file temporarily.
         </div>
         <input
           type="text"
