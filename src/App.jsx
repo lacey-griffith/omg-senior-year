@@ -527,6 +527,7 @@ export default function SeniorYearHub() {
   const [kidFilter, setKidFilter] = useState("both"); // "both" | "tyler" | "gracie"
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
   const [lastSynced, setLastSynced] = useState(null);
+  const [syncError, setSyncError] = useState("");
   const [memberId, setMemberId] = useState(loadMemberId);
   const hasLoadedRemoteRef = useRef(false);
   const pushTimeoutRef = useRef(null);
@@ -557,12 +558,14 @@ export default function SeniorYearHub() {
         }
         hasLoadedRemoteRef.current = true;
         setSyncStatus("synced");
+        setSyncError("");
         setLastSynced(new Date());
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
         hasLoadedRemoteRef.current = true;
         setSyncStatus("error");
+        setSyncError(err && err.message ? err.message : "Couldn't reach the sync URL");
       });
     return () => {
       cancelled = true;
@@ -578,9 +581,13 @@ export default function SeniorYearHub() {
       pushRemoteStore(syncUrl, store)
         .then(() => {
           setSyncStatus("synced");
+          setSyncError("");
           setLastSynced(new Date());
         })
-        .catch(() => setSyncStatus("error"));
+        .catch((err) => {
+          setSyncStatus("error");
+          setSyncError(err && err.message ? err.message : "Couldn't save to the sync URL");
+        });
     }, 1500);
     return () => clearTimeout(pushTimeoutRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -609,7 +616,12 @@ export default function SeniorYearHub() {
   const adminEmail = (APP_CONFIG.adminEmail || "").trim().toLowerCase();
   const me = memberId ? members.find((m) => m.id === memberId) : null;
   const isAdmin = !!(me && adminEmail && me.email.trim().toLowerCase() === adminEmail);
-  const pendingCount = members.filter((m) => m.status === "pending").length;
+  const pendingPeople = members.filter((m) => m.status === "pending").length;
+  const pendingPhotoCount = Object.keys(THEMES).reduce(
+    (n, k) => n + ((store[k] && store[k].photos) || []).filter((p) => !p.approved).length,
+    0
+  );
+  const pendingCount = pendingPeople + pendingPhotoCount;
   const perms = permsFor(me, isAdmin);
 
   /* ---------- membership ---------- */
@@ -692,13 +704,23 @@ export default function SeniorYearHub() {
       <SignupWizard
         onSubmit={requestAccess}
         adminEmail={adminEmail}
+        syncStatus={syncStatus}
         findMemberByEmail={findMemberByEmail}
         onResume={resumeAsMember}
       />
     );
   }
   if (me.status === "pending") {
-    return <PendingApprovalScreen member={me} onSwitch={switchMember} syncStatus={syncStatus} />;
+    return (
+      <PendingApprovalScreen
+        member={me}
+        onSwitch={switchMember}
+        syncStatus={syncStatus}
+        syncError={syncError}
+        adminEmail={adminEmail}
+        syncUrl={syncUrl}
+      />
+    );
   }
   if (me.status === "denied") {
     return <DeniedScreen member={me} onSwitch={switchMember} />;
@@ -723,6 +745,9 @@ export default function SeniorYearHub() {
         me={me}
         isAdmin={isAdmin}
         syncStatus={syncStatus}
+        pendingCount={pendingCount}
+        onOpenAdmin={() => setTab("admin")}
+        currentTab={tab}
         kidFilter={kidFilter}
         setKidFilter={setKidFilter}
         showKidFilter={tab !== "admin"}
@@ -795,6 +820,7 @@ export default function SeniorYearHub() {
               members={members}
               me={me}
               syncStatus={syncStatus}
+              syncError={syncError}
               lastSynced={lastSynced}
               onApproveMember={approveMember}
               onDenyMember={denyMember}
@@ -856,7 +882,7 @@ const GATE_INPUT_STYLE = {
    partway through. The admin sees the whole profile when reviewing. */
 const SIGNUP_STEPS = ["You", "Connection", "Photo", "Review"];
 
-function SignupWizard({ onSubmit, adminEmail, findMemberByEmail, onResume }) {
+function SignupWizard({ onSubmit, adminEmail, findMemberByEmail, onResume, syncStatus }) {
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -996,10 +1022,28 @@ function SignupWizard({ onSubmit, adminEmail, findMemberByEmail, onResume }) {
               </div>
             )}
 
-            {isAdminEmail && (
-              <div style={{ fontSize: 11.5, color: "#4B2E83", fontWeight: 700, marginBottom: 12 }}>
+            {isAdminEmail ? (
+              <div
+                style={{
+                  background: "#EFECF7",
+                  border: "1px solid #D9D2EC",
+                  borderRadius: 9,
+                  padding: "9px 12px",
+                  fontSize: 12,
+                  color: "#4B2E83",
+                  fontWeight: 700,
+                  marginBottom: 12,
+                }}
+              >
                 ★ Admin account — you'll go straight in, no waiting.
               </div>
+            ) : (
+              adminEmail && (
+                <div style={{ fontSize: 11, color: "#A19DAF", marginBottom: 12, lineHeight: 1.5 }}>
+                  Admin? Use <code style={{ wordBreak: "break-all" }}>{adminEmail}</code> — any other
+                  address goes into the approval queue.
+                </div>
+              )
             )}
 
             <WizardButtons
@@ -1148,6 +1192,24 @@ function SignupWizard({ onSubmit, adminEmail, findMemberByEmail, onResume }) {
                 : "Here's what gets sent to the family admin for approval."}
             </div>
 
+            {syncStatus === "error" && !isAdminEmail && (
+              <div
+                style={{
+                  background: "#FDF0F0",
+                  border: "1px solid #E8B4B4",
+                  borderRadius: 10,
+                  padding: "11px 13px",
+                  fontSize: 12,
+                  color: "#8A2E2E",
+                  marginBottom: 14,
+                  lineHeight: 1.5,
+                }}
+              >
+                ⚠ This device can't reach the shared hub right now, so your request won't get
+                through to the admin until the connection is back.
+              </div>
+            )}
+
             <div
               style={{
                 border: "1px solid #EDEAF3",
@@ -1266,15 +1328,27 @@ function WizardButtons({ onBack, onNext, nextReady, nextLabel }) {
 }
 
 
-function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
+function PendingApprovalScreen({ member, onSwitch, syncStatus, syncError, adminEmail, syncUrl }) {
+  const offline = syncStatus === "error" || !syncUrl;
+  // If this device can't reach the shared file, the request is sitting in this
+  // browser and nobody else can see it. Say so plainly rather than letting
+  // someone wait on an approval that will never arrive.
+  const looksLikeAdmin =
+    adminEmail &&
+    member.email.trim().toLowerCase() !== adminEmail &&
+    member.email.trim().toLowerCase().split("@")[1] === adminEmail.split("@")[1];
+
   return (
     <div style={GATE_WRAP_STYLE}>
       <div style={GATE_CARD_STYLE}>
-        <div style={{ fontSize: 30, marginBottom: 6 }}>⏳</div>
-        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Waiting for approval</div>
+        <div style={{ fontSize: 30, marginBottom: 6 }}>{offline ? "⚠️" : "⏳"}</div>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>
+          {offline ? "Request couldn't be sent" : "Waiting for approval"}
+        </div>
         <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 18, lineHeight: 1.5 }}>
-          Thanks, {member.name}! Your request has been sent to the family admin. Once they approve
-          you, this page will let you straight in — just refresh after they give you the nod.
+          {offline
+            ? "This device can't reach the shared family hub, so your request is stuck here and the admin can't see it yet."
+            : `Thanks, ${member.name}! Your request has been sent to the family admin. Once they approve you, this page will let you straight in.`}
         </div>
 
         <div
@@ -1330,6 +1404,50 @@ function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
           )}
         </div>
 
+        {looksLikeAdmin && (
+          <div
+            style={{
+              background: "#FFF4E5",
+              border: "1px solid #F5D9A8",
+              borderRadius: 10,
+              padding: "11px 13px",
+              fontSize: 12,
+              color: "#7A5A1A",
+              marginBottom: 14,
+              lineHeight: 1.5,
+              textAlign: "left",
+            }}
+          >
+            <strong>Are you the admin?</strong> This hub's admin account is{" "}
+            <code style={{ wordBreak: "break-all" }}>{adminEmail}</code>. You signed up with a
+            different address, so you're in the approval queue instead. Start over and use the
+            admin address to get straight in.
+          </div>
+        )}
+
+        {offline && (
+          <div
+            style={{
+              background: "#FDF0F0",
+              border: "1px solid #E8B4B4",
+              borderRadius: 10,
+              padding: "11px 13px",
+              fontSize: 11.5,
+              color: "#8A2E2E",
+              marginBottom: 14,
+              lineHeight: 1.5,
+              textAlign: "left",
+            }}
+          >
+            <strong>Connection problem.</strong>
+            <div style={{ marginTop: 4 }}>
+              {!syncUrl
+                ? "No sync URL is configured for this hub."
+                : syncError || "The sync service didn't respond."}
+            </div>
+          </div>
+        )}
+
         <button
           onClick={() => window.location.reload()}
           style={{
@@ -1345,7 +1463,7 @@ function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
             marginBottom: 10,
           }}
         >
-          🔄 Check again
+          🔄 Try again
         </button>
 
         <button
@@ -1364,13 +1482,6 @@ function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
         >
           That's not me — start over
         </button>
-
-        {syncStatus === "error" && (
-          <div style={{ fontSize: 11.5, color: "#B33A3A", marginTop: 12, lineHeight: 1.5 }}>
-            ⚠ Couldn't reach the shared hub data right now, so approvals may not show up until the
-            connection's back.
-          </div>
-        )}
       </div>
     </div>
   );
@@ -1413,7 +1524,7 @@ function DeniedScreen({ member, onSwitch }) {
    APP HEADER — single bar across the whole app. Replaces the old
    per-kid switcher; kids are now a filter, not separate pages.
    ============================================================ */
-function AppHeader({ me, isAdmin, syncStatus, kidFilter, setKidFilter, showKidFilter }) {
+function AppHeader({ me, isAdmin, syncStatus, kidFilter, setKidFilter, showKidFilter, pendingCount, onOpenAdmin, currentTab }) {
   const syncIcon =
     syncStatus === "syncing" ? "🔄" : syncStatus === "synced" ? "🟢" : syncStatus === "error" ? "🔴" : "";
   const syncTitle =
@@ -1464,6 +1575,38 @@ function AppHeader({ me, isAdmin, syncStatus, kidFilter, setKidFilter, showKidFi
           </span>
         </div>
       </div>
+
+      {isAdmin && pendingCount > 0 && currentTab !== "admin" && (
+        <button
+          onClick={onOpenAdmin}
+          style={{
+            width: "100%",
+            background: "#E4611F",
+            color: "#fff",
+            border: "none",
+            padding: "8px 16px",
+            fontSize: 12.5,
+            fontWeight: 800,
+            cursor: "pointer",
+            textAlign: "left",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <span
+            style={{
+              background: "rgba(255,255,255,0.28)",
+              borderRadius: 10,
+              padding: "1px 7px",
+              fontSize: 11.5,
+            }}
+          >
+            {pendingCount}
+          </span>
+          waiting for your review — tap to open
+        </button>
+      )}
 
       {showKidFilter && (
         <div
@@ -1905,14 +2048,23 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
 
       {perms.viewParty && (
         <SectionCard title="Grad party progress">
-          {visibleKids.map((k) => (
-            <div key={k} style={{ marginBottom: 12 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                <span style={{ fontSize: 12.5, fontWeight: 700 }}>{THEMES[k].name}</span>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: visibleKids.length > 1 ? "1fr 1fr" : "1fr",
+              gap: 16,
+            }}
+          >
+            {visibleKids.map((k) => (
+              <div key={k} style={{ minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                  <KidDot kid={THEMES[k]} />
+                  <span style={{ fontSize: 12.5, fontWeight: 700 }}>{THEMES[k].name}</span>
+                </div>
+                <PartySummary theme={THEMES[k]} data={store[k]} />
               </div>
-              <PartySummary theme={THEMES[k]} data={store[k]} />
-            </div>
-          ))}
+            ))}
+          </div>
           <TapLink onClick={() => setTab("party")} label="Open party planner →" />
         </SectionCard>
       )}
@@ -3405,6 +3557,36 @@ function GalleryTab({ store, visibleKids, updateKidData, perms, currentUser, set
   const [openDetailConfirming, setOpenDetailConfirming] = useState(false);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
   const [driveNote, setDriveNote] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null);
+
+  async function testConnection() {
+    const url = (settings && settings.syncUrl) || "";
+    if (!url) {
+      setTestResult({ ok: false, msg: "No sync URL is set in the app config." });
+      return;
+    }
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const data = await fetchRemoteStore(url);
+      const memberCount = ((data && data.settings && data.settings.members) || []).length;
+      setTestResult({
+        ok: true,
+        msg: `✓ Connected. The shared file currently has ${memberCount} member record${memberCount === 1 ? "" : "s"}.`,
+      });
+    } catch (err) {
+      setTestResult({
+        ok: false,
+        msg:
+          "✕ Couldn't reach it: " +
+          (err && err.message ? err.message : "unknown error") +
+          ". Check that the Apps Script deployment is live and set to \"Anyone\" access.",
+      });
+    } finally {
+      setTesting(false);
+    }
+  }
 
   const syncUrl = (settings && settings.syncUrl) || "";
   const canModerate = perms.approvePhotos;
@@ -4183,11 +4365,19 @@ function PartyTab({ store, visibleKids, updateKidData, perms }) {
         </div>
       )}
 
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: visibleKids.length > 1 ? "1fr 1fr" : "1fr",
+          gap: 14,
+          alignItems: "start",
+        }}
+      >
       {visibleKids.map((kidKey) => {
         const theme = THEMES[kidKey];
         const data = store[kidKey];
         return (
-          <div key={kidKey}>
+          <div key={kidKey} style={{ minWidth: 0 }}>
             <div
               style={{
                 display: "flex",
@@ -4226,6 +4416,7 @@ function PartyTab({ store, visibleKids, updateKidData, perms }) {
           </div>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -5160,6 +5351,7 @@ function BottomNav({ tab, setTab, perms, isAdmin, pendingCount }) {
    reminder numbers, and sync status all live here.
    ============================================================ */
 function AdminPage({
+  syncError,
   store,
   updateKidData,
   currentUser,
@@ -5700,11 +5892,64 @@ function AdminPage({
               {syncStatus === "error" && "🔴 Can't reach the shared file — changes are local only"}
               {syncStatus === "idle" && "Sync isn't configured"}
             </div>
-            <div style={{ fontSize: 11.5, color: "#8A8494", lineHeight: 1.5 }}>
-              Everything is stored in one JSON file in your Google Drive. Each save replaces the
-              whole file, so if two people save at the same instant, one change can overwrite the
-              other.
+
+            {syncStatus === "error" && (
+              <div
+                style={{
+                  background: "#FDF0F0",
+                  border: "1px solid #E8B4B4",
+                  borderRadius: 9,
+                  padding: "10px 12px",
+                  fontSize: 11.5,
+                  color: "#8A2E2E",
+                  marginBottom: 10,
+                  lineHeight: 1.5,
+                }}
+              >
+                <strong>While this is broken, nobody's requests reach you</strong> — each device is
+                only saving to itself.
+                {syncError && <div style={{ marginTop: 5 }}>Details: {syncError}</div>}
+              </div>
+            )}
+
+            <div style={{ fontSize: 11.5, color: "#8A8494", lineHeight: 1.5, marginBottom: 10 }}>
+              Everything lives in one JSON file in your Google Drive. Each save replaces the whole
+              file, so if two people save at the same instant, one change can overwrite the other.
             </div>
+
+            <div style={{ fontSize: 11, color: "#A19DAF", wordBreak: "break-all", marginBottom: 10 }}>
+              <strong>Sync URL:</strong> {settings.syncUrl || "(none set)"}
+            </div>
+
+            <button
+              onClick={testConnection}
+              disabled={testing}
+              style={{
+                background: "transparent",
+                border: "1.5px solid #4B2E83",
+                borderRadius: 9,
+                padding: "9px 14px",
+                fontWeight: 700,
+                fontSize: 12.5,
+                cursor: testing ? "wait" : "pointer",
+                color: "#4B2E83",
+              }}
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </button>
+            {testResult && (
+              <div
+                style={{
+                  marginTop: 10,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: testResult.ok ? "#2E7D32" : "#8A2E2E",
+                  lineHeight: 1.5,
+                }}
+              >
+                {testResult.msg}
+              </div>
+            )}
           </SectionCard>
 
           <SectionCard title="Your account">
