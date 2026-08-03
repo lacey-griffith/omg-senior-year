@@ -199,6 +199,7 @@ function loadStore() {
       if (parsed.settings.deviceUnlocked === undefined) parsed.settings.deviceUnlocked = false;
       if (parsed.settings.syncUrl === undefined) parsed.settings.syncUrl = APP_CONFIG.syncUrl;
       if (parsed.settings.googleClientId === undefined) parsed.settings.googleClientId = APP_CONFIG.googleClientId;
+      if (!parsed.settings.members) parsed.settings.members = [];
       ["tyler", "gracie"].forEach((k) => {
         if (parsed[k] && parsed[k].headerPreset === undefined) parsed[k].headerPreset = "solid";
         if (parsed[k] && parsed[k].headerBg === undefined) parsed[k].headerBg = null;
@@ -220,6 +221,7 @@ function loadStore() {
       deviceUnlocked: false,
       syncUrl: APP_CONFIG.syncUrl,
       googleClientId: APP_CONFIG.googleClientId,
+      members: [],
     },
   };
   ["tyler", "gracie"].forEach((k) => {
@@ -248,6 +250,33 @@ function saveStore(store) {
 /* ---------- Google auth session (sessionStorage only — clears when the
    browser tab/session ends, so signing in doesn't linger forever) ---------- */
 const AUTH_SESSION_KEY = "senior_hub_google_auth";
+
+/* ---------- Member identity (who's using this device) ----------
+   Stored in localStorage so a family member only introduces themselves
+   once per device. The actual approve/deny decision lives in the shared
+   synced members list, so approving on your phone unlocks their device. */
+const MEMBER_KEY = "senior_hub_member_id";
+
+function loadMemberId() {
+  try {
+    return localStorage.getItem(MEMBER_KEY) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveMemberId(id) {
+  try {
+    localStorage.setItem(MEMBER_KEY, id);
+  } catch (e) {}
+}
+
+function clearMemberId() {
+  try {
+    localStorage.removeItem(MEMBER_KEY);
+  } catch (e) {}
+}
+
 
 function loadGoogleAuthSession() {
   try {
@@ -438,6 +467,7 @@ export default function SeniorYearHub() {
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
   const [lastSynced, setLastSynced] = useState(null);
   const [googleAuth, setGoogleAuth] = useState(loadGoogleAuthSession); // { token, email, name, picture, exp }
+  const [memberId, setMemberId] = useState(loadMemberId);
   const hasLoadedRemoteRef = useRef(false);
   const pushTimeoutRef = useRef(null);
   const syncUrl = (store.settings && store.settings.syncUrl) || "";
@@ -546,8 +576,62 @@ export default function SeniorYearHub() {
     setGoogleAuth(null);
   }
 
-  const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "" };
-  const needsPasscode = !googleClientId && !!settings.accessCode && !settings.deviceUnlocked;
+  const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "", members: [] };
+  const members = settings.members || [];
+  const membersEnabled = !googleClientId; // member flow is the default when Google auth isn't set up
+  const me = memberId ? members.find((m) => m.id === memberId) : null;
+  const isAdmin = !!(me && me.role === "admin");
+  const pendingCount = members.filter((m) => m.status === "pending").length;
+
+  function requestAccess(name, email) {
+    const id = "m" + Date.now() + Math.random().toString(36).slice(2, 7);
+    // The very first person to sign up becomes the admin automatically —
+    // that's you, since you'll set it up first.
+    const isFirst = members.length === 0;
+    const newMember = {
+      id,
+      name: name.trim(),
+      email: email.trim(),
+      status: isFirst ? "approved" : "pending",
+      role: isFirst ? "admin" : "member",
+      requestedAt: new Date().toISOString(),
+    };
+    updateSettings((s) => ({ ...s, members: [...(s.members || []), newMember] }));
+    saveMemberId(id);
+    setMemberId(id);
+  }
+
+  function approveMember(id) {
+    updateSettings((s) => ({
+      ...s,
+      members: (s.members || []).map((m) => (m.id === id ? { ...m, status: "approved" } : m)),
+    }));
+  }
+
+  function denyMember(id) {
+    updateSettings((s) => ({
+      ...s,
+      members: (s.members || []).map((m) => (m.id === id ? { ...m, status: "denied" } : m)),
+    }));
+  }
+
+  function removeMember(id) {
+    updateSettings((s) => ({ ...s, members: (s.members || []).filter((m) => m.id !== id) }));
+  }
+
+  function makeAdmin(id) {
+    updateSettings((s) => ({
+      ...s,
+      members: (s.members || []).map((m) => (m.id === id ? { ...m, role: "admin" } : m)),
+    }));
+  }
+
+  function switchMember() {
+    clearMemberId();
+    setMemberId(null);
+  }
+
+  const needsPasscode = !googleClientId && !membersEnabled && !!settings.accessCode && !settings.deviceUnlocked;
 
   if (needsGoogleAuth) {
     return (
@@ -557,6 +641,19 @@ export default function SeniorYearHub() {
         onAuthed={handleAuthed}
       />
     );
+  }
+
+  // Member flow: introduce yourself, then wait for the admin to approve.
+  if (membersEnabled && !me) {
+    return <RequestAccessGate onRequest={requestAccess} isFirst={members.length === 0} />;
+  }
+
+  if (membersEnabled && me && me.status === "pending") {
+    return <PendingApprovalScreen member={me} onSwitch={switchMember} syncStatus={syncStatus} />;
+  }
+
+  if (membersEnabled && me && me.status === "denied") {
+    return <DeniedScreen member={me} onSwitch={switchMember} />;
   }
 
   if (needsPasscode) {
@@ -590,6 +687,9 @@ export default function SeniorYearHub() {
         syncStatus={syncStatus}
         googleAuth={googleAuth}
         onSignOut={handleSignOut}
+        me={me}
+        isAdmin={isAdmin}
+        pendingCount={pendingCount}
       />
 
       {isOverview ? (
@@ -612,11 +712,11 @@ export default function SeniorYearHub() {
                 settings={store.settings || { phoneNumbers: [] }}
                 onOpenReminders={() => setShowReminders(true)}
                 familyView={familyView}
-                currentUser={googleAuth}
+                currentUser={me || googleAuth}
               />
             )}
             {tab === "gallery" && (
-              <GalleryTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} currentUser={googleAuth} />
+              <GalleryTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} currentUser={me || googleAuth} />
             )}
             {tab === "party" && (
               <PartyTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
@@ -638,6 +738,15 @@ export default function SeniorYearHub() {
           lastSynced={lastSynced}
           googleAuth={googleAuth}
           onSignOut={handleSignOut}
+          me={me}
+          isAdmin={isAdmin}
+          members={members}
+          membersEnabled={membersEnabled}
+          onApproveMember={approveMember}
+          onDenyMember={denyMember}
+          onRemoveMember={removeMember}
+          onMakeAdmin={makeAdmin}
+          onSwitchMember={switchMember}
         />
       )}
     </div>
@@ -743,6 +852,210 @@ function AccessGate({ accessCode, onUnlock }) {
    A rejected/invalid token never gets past that server-side check, even
    if someone bypassed this screen entirely.
    ============================================================ */
+/* ============================================================
+   MEMBER ACCESS FLOW — introduce yourself, admin approves.
+   No passwords: this is an access-request queue, not authentication.
+   It keeps casual visitors out and lets the admin control who's in,
+   without storing anyone's password in a file we can't protect.
+   ============================================================ */
+const GATE_WRAP_STYLE = {
+  minHeight: "100vh",
+  background: "linear-gradient(135deg, #2B2B2B, #4B2E83)",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  padding: 20,
+  boxSizing: "border-box",
+  fontFamily: "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
+};
+
+const GATE_CARD_STYLE = {
+  background: "#fff",
+  borderRadius: 16,
+  padding: 28,
+  width: "100%",
+  maxWidth: 380,
+  boxSizing: "border-box",
+  textAlign: "center",
+};
+
+const GATE_INPUT_STYLE = {
+  width: "100%",
+  boxSizing: "border-box",
+  border: "1.5px solid #E0DCE8",
+  borderRadius: 9,
+  padding: "12px 14px",
+  fontSize: 15,
+  marginBottom: 10,
+  fontFamily: "inherit",
+};
+
+function RequestAccessGate({ onRequest, isFirst }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+
+  const ready = name.trim().length > 0 && email.trim().length > 0;
+
+  return (
+    <div style={GATE_WRAP_STYLE}>
+      <div style={GATE_CARD_STYLE}>
+        <div style={{ fontSize: 30, marginBottom: 6 }}>{isFirst ? "👋" : "🔒"}</div>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
+        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
+          {isFirst
+            ? "Welcome! You're the first one here, so you'll be set up as the admin — you'll approve everyone else who requests access."
+            : "This family hub is private. Tell us who you are and we'll send a request to the family admin for approval."}
+        </div>
+
+        <input
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Your name"
+          autoFocus
+          style={GATE_INPUT_STYLE}
+        />
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && ready && onRequest(name, email)}
+          placeholder="Your email"
+          style={{ ...GATE_INPUT_STYLE, marginBottom: 16 }}
+        />
+
+        <button
+          onClick={() => ready && onRequest(name, email)}
+          disabled={!ready}
+          style={{
+            width: "100%",
+            background: ready ? "#4B2E83" : "#E7E1F5",
+            color: ready ? "#fff" : "#A8A2BC",
+            border: "none",
+            borderRadius: 9,
+            padding: "12px 0",
+            fontWeight: 800,
+            fontSize: 14.5,
+            cursor: ready ? "pointer" : "not-allowed",
+          }}
+        >
+          {isFirst ? "Set up my hub" : "Request access"}
+        </button>
+
+        <div style={{ fontSize: 11, color: "#A19DAF", marginTop: 14, lineHeight: 1.5 }}>
+          No password needed — the admin approves each person by hand.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
+  return (
+    <div style={GATE_WRAP_STYLE}>
+      <div style={GATE_CARD_STYLE}>
+        <div style={{ fontSize: 30, marginBottom: 6 }}>⏳</div>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Waiting for approval</div>
+        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 18, lineHeight: 1.5 }}>
+          Thanks, {member.name}! Your request has been sent to the family admin. Once they approve
+          you, this page will let you straight in — just refresh after they give you the nod.
+        </div>
+
+        <div
+          style={{
+            background: "#F7F5FB",
+            border: "1px solid #E7E1F5",
+            borderRadius: 10,
+            padding: "10px 12px",
+            fontSize: 12,
+            color: "#5A5468",
+            marginBottom: 16,
+            lineHeight: 1.5,
+            textAlign: "left",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 3 }}>Requested as</div>
+          <div>{member.name}</div>
+          <div style={{ color: "#8A8494" }}>{member.email}</div>
+        </div>
+
+        <button
+          onClick={() => window.location.reload()}
+          style={{
+            width: "100%",
+            background: "#4B2E83",
+            color: "#fff",
+            border: "none",
+            borderRadius: 9,
+            padding: "12px 0",
+            fontWeight: 800,
+            fontSize: 14.5,
+            cursor: "pointer",
+            marginBottom: 10,
+          }}
+        >
+          🔄 Check again
+        </button>
+
+        <button
+          onClick={onSwitch}
+          style={{
+            width: "100%",
+            background: "transparent",
+            border: "1.5px solid #E0DCE8",
+            borderRadius: 9,
+            padding: "11px 0",
+            fontWeight: 700,
+            fontSize: 13.5,
+            cursor: "pointer",
+            color: "#8A8494",
+          }}
+        >
+          That's not me — start over
+        </button>
+
+        {syncStatus === "error" && (
+          <div style={{ fontSize: 11.5, color: "#B33A3A", marginTop: 12, lineHeight: 1.5 }}>
+            ⚠ Couldn't reach the shared hub data right now, so approvals may not show up until the
+            connection's back.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DeniedScreen({ member, onSwitch }) {
+  return (
+    <div style={GATE_WRAP_STYLE}>
+      <div style={GATE_CARD_STYLE}>
+        <div style={{ fontSize: 30, marginBottom: 6 }}>🚫</div>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Access not granted</div>
+        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 18, lineHeight: 1.5 }}>
+          The family admin didn't approve this request. If you think that's a mistake, reach out to
+          them directly.
+        </div>
+        <button
+          onClick={onSwitch}
+          style={{
+            width: "100%",
+            background: "transparent",
+            border: "1.5px solid #E0DCE8",
+            borderRadius: 9,
+            padding: "11px 0",
+            fontWeight: 700,
+            fontSize: 13.5,
+            cursor: "pointer",
+            color: "#8A8494",
+          }}
+        >
+          Start over
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function GoogleSignInGate({ clientId, syncUrl, onAuthed }) {
   const buttonRef = useRef(null);
   const [ready, setReady] = useState(false);
@@ -872,7 +1185,7 @@ const OVERVIEW_BAR = {
   onPrimary: "#FFFFFF",
 };
 
-function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, setFamilyView, syncStatus, googleAuth, onSignOut }) {
+function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, setFamilyView, syncStatus, googleAuth, onSignOut, me, isAdmin, pendingCount }) {
   const options = [OVERVIEW_BAR, ...Object.values(THEMES)];
   return (
     <>
@@ -999,9 +1312,27 @@ function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, set
             )}
           </button>
         )}
+        {me && (
+          <span
+            title={"Signed in as " + me.name + (isAdmin ? " (admin)" : "")}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              padding: "0 10px",
+              background: "#1A1A1A",
+              color: "#fff",
+              fontSize: 11,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {isAdmin ? "★" : "👤"} {me.name.split(" ")[0]}
+          </span>
+        )}
         <button
           onClick={onOpenReminders}
-          title="Text reminder settings"
+          title={isAdmin && pendingCount > 0 ? pendingCount + " access request(s) waiting" : "Settings"}
           style={{
             border: "none",
             cursor: "pointer",
@@ -1010,9 +1341,32 @@ function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, set
             padding: "0 14px",
             fontSize: 16,
             flexShrink: 0,
+            position: "relative",
           }}
         >
           ⚙️
+          {isAdmin && pendingCount > 0 && (
+            <span
+              style={{
+                position: "absolute",
+                top: 4,
+                right: 6,
+                background: "#E4611F",
+                color: "#fff",
+                borderRadius: "50%",
+                minWidth: 15,
+                height: 15,
+                fontSize: 9.5,
+                fontWeight: 800,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "0 3px",
+              }}
+            >
+              {pendingCount}
+            </span>
+          )}
         </button>
       </div>
       {familyView && (
@@ -3938,7 +4292,7 @@ function BottomNav({ theme, tab, setTab }) {
    REMINDERS SETTINGS — manage phone numbers used for text reminders
    Shared across both kids since it's the same parents.
    ============================================================ */
-function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut }) {
+function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onMakeAdmin, onSwitchMember }) {
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const [codeInput, setCodeInput] = useState(settings.accessCode || "");
@@ -4021,6 +4375,280 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
           boxSizing: "border-box",
         }}
       >
+        {membersEnabled && (
+          <>
+            <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>
+              👥 Family members
+            </div>
+            <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
+              {isAdmin
+                ? "You're the admin. New people who open the hub request access here, and they can't see anything until you approve them."
+                : "You're signed in as a family member. Only the admin can approve new people."}
+            </div>
+
+            {me && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  border: "1px solid #EDEAF3",
+                  borderRadius: 9,
+                  padding: "9px 12px",
+                  marginBottom: 14,
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 700 }}>
+                    {me.name} {isAdmin && <span style={{ color: "#4B2E83" }}>★ admin</span>}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "#8A8494" }}>{me.email}</div>
+                </div>
+                <button
+                  onClick={onSwitchMember}
+                  style={{
+                    background: "transparent",
+                    border: "1px solid #E0DCE8",
+                    borderRadius: 7,
+                    padding: "6px 12px",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    color: "#8A2E2E",
+                  }}
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
+
+            {isAdmin && (
+              <>
+                {members.filter((m) => m.status === "pending").length > 0 && (
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: "#7A5A1A", marginBottom: 8 }}>
+                      ⏳ WAITING FOR YOUR APPROVAL
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {members
+                        .filter((m) => m.status === "pending")
+                        .map((m) => (
+                          <div
+                            key={m.id}
+                            style={{
+                              border: "1px solid #F5D9A8",
+                              background: "#FFF9EF",
+                              borderRadius: 9,
+                              padding: "10px 12px",
+                            }}
+                          >
+                            <div style={{ fontSize: 13.5, fontWeight: 700 }}>{m.name}</div>
+                            <div style={{ fontSize: 12, color: "#8A8494", marginBottom: 8 }}>{m.email}</div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button
+                                onClick={() => onApproveMember(m.id)}
+                                style={{
+                                  flex: 1,
+                                  background: "#2E7D32",
+                                  color: "#fff",
+                                  border: "none",
+                                  borderRadius: 7,
+                                  padding: "8px 0",
+                                  fontSize: 12.5,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                ✓ Approve
+                              </button>
+                              <button
+                                onClick={() => onDenyMember(m.id)}
+                                style={{
+                                  flex: 1,
+                                  background: "transparent",
+                                  color: "#8A2E2E",
+                                  border: "1.5px solid #E8B4B4",
+                                  borderRadius: 7,
+                                  padding: "8px 0",
+                                  fontSize: 12.5,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                ✕ Deny
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ fontSize: 12, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
+                  APPROVED ({members.filter((m) => m.status === "approved").length})
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+                  {members
+                    .filter((m) => m.status === "approved")
+                    .map((m) => (
+                      <div
+                        key={m.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          border: "1px solid #EDEAF3",
+                          borderRadius: 9,
+                          padding: "9px 12px",
+                          gap: 8,
+                        }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700 }}>
+                            {m.name}{" "}
+                            {m.role === "admin" && <span style={{ color: "#4B2E83", fontSize: 11 }}>★</span>}
+                          </div>
+                          <div
+                            style={{
+                              fontSize: 11.5,
+                              color: "#8A8494",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {m.email}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                          {m.role !== "admin" && (
+                            <>
+                              <button
+                                onClick={() => onMakeAdmin(m.id)}
+                                title="Make admin"
+                                style={{
+                                  background: "transparent",
+                                  border: "1px solid #E0DCE8",
+                                  borderRadius: 6,
+                                  padding: "5px 8px",
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  color: "#4B2E83",
+                                }}
+                              >
+                                ★
+                              </button>
+                              <button
+                                onClick={() => onRemoveMember(m.id)}
+                                title="Remove"
+                                style={{
+                                  background: "transparent",
+                                  border: "1px solid #E8B4B4",
+                                  borderRadius: 6,
+                                  padding: "5px 8px",
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  color: "#8A2E2E",
+                                }}
+                              >
+                                ✕
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+
+                {members.filter((m) => m.status === "denied").length > 0 && (
+                  <>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
+                      DENIED ({members.filter((m) => m.status === "denied").length})
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+                      {members
+                        .filter((m) => m.status === "denied")
+                        .map((m) => (
+                          <div
+                            key={m.id}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              border: "1px solid #EDEAF3",
+                              borderRadius: 9,
+                              padding: "8px 12px",
+                              opacity: 0.7,
+                            }}
+                          >
+                            <div style={{ fontSize: 12.5 }}>
+                              {m.name}{" "}
+                              <span style={{ color: "#8A8494" }}>{m.email}</span>
+                            </div>
+                            <div style={{ display: "flex", gap: 6 }}>
+                              <button
+                                onClick={() => onApproveMember(m.id)}
+                                style={{
+                                  background: "transparent",
+                                  border: "1px solid #BFE0C0",
+                                  borderRadius: 6,
+                                  padding: "4px 8px",
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  color: "#2E7D32",
+                                }}
+                              >
+                                Allow
+                              </button>
+                              <button
+                                onClick={() => onRemoveMember(m.id)}
+                                style={{
+                                  background: "transparent",
+                                  border: "1px solid #E0DCE8",
+                                  borderRadius: 6,
+                                  padding: "4px 8px",
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  color: "#8A8494",
+                                }}
+                              >
+                                Clear
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                    </div>
+                  </>
+                )}
+
+                <div
+                  style={{
+                    background: "#FFF4E5",
+                    border: "1px solid #F5D9A8",
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 11.5,
+                    color: "#7A5A1A",
+                    marginBottom: 22,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  ⓘ Worth knowing: this is an access-request list, not password login. It keeps
+                  casual visitors out and lets you control who's in, but it isn't strong security —
+                  someone technical who has the link could work around it. Don't post the link
+                  publicly, and don't put anything in here you'd be upset to have seen.
+                </div>
+              </>
+            )}
+
+            <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
+          </>
+        )}
+
         <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>👤 Google Sign-In (real auth)</div>
         <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
           This is normally pre-configured for the whole family (baked into the site itself, same
