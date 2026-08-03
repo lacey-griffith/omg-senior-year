@@ -258,6 +258,23 @@ const PHOTO_TAGS = [
 /* ---------- storage helpers ---------- */
 const STORAGE_KEY = "senior_hub_v2";
 
+/* The party checklist started life as a hardcoded list. Converting it to real
+   records (with ids) is what makes add/rename/delete possible. */
+function seedPartyItems() {
+  const out = [];
+  PARTY_CATEGORIES.forEach((cat) => {
+    cat.items.forEach((label, i) => {
+      out.push({
+        id: `${cat.id}-${i}`,
+        categoryId: cat.id,
+        label,
+        done: false,
+      });
+    });
+  });
+  return out;
+}
+
 function defaultCountdowns(kidKey) {
   return [{ id: "graduation", label: "Graduation", date: THEMES[kidKey].graduation.slice(0, 10), locked: true }];
 }
@@ -276,6 +293,7 @@ function loadStore() {
         if (parsed[k] && !parsed[k].countdowns) parsed[k].countdowns = defaultCountdowns(k);
         if (parsed[k] && !parsed[k].activeCountdown) parsed[k].activeCountdown = "graduation";
         if (parsed[k] && !parsed[k].budget) parsed[k].budget = { categories: DEFAULT_BUDGET_CATEGORIES.map((c) => ({ ...c })) };
+        if (parsed[k] && !parsed[k].partyItems) parsed[k].partyItems = seedPartyItems();
         if (parsed[k] && parsed[k].profilePic === undefined) parsed[k].profilePic = null;
         if (parsed[k] && parsed[k].photos) {
           parsed[k].photos = parsed[k].photos.map((p) => (p.tags ? p : { ...p, tags: [] }));
@@ -302,6 +320,7 @@ function loadStore() {
       countdowns: defaultCountdowns(k),
       activeCountdown: "graduation",
       budget: { categories: DEFAULT_BUDGET_CATEGORIES.map((c) => ({ ...c })) },
+      partyItems: seedPartyItems(),
       profilePic: null,
     };
   });
@@ -419,6 +438,13 @@ function fmtTime(t) {
   const period = h >= 12 ? "PM" : "AM";
   const h12 = h % 12 === 0 ? 12 : h % 12;
   return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+}
+
+/* Events predate having stable ids, so fall back to matching on content.
+   Newer events carry an id and match on that alone. */
+function sameEvent(a, b) {
+  if (a.id && b.id) return a.id === b.id;
+  return a.date === b.date && a.title === b.title && (a.time || "") === (b.time || "");
 }
 
 function monthLabel(iso) {
@@ -761,6 +787,9 @@ export default function SeniorYearHub() {
         {tab === "admin" &&
           (isAdmin ? (
             <AdminPage
+              store={store}
+              updateKidData={updateKidData}
+              currentUser={me}
               settings={settings}
               updateSettings={updateSettings}
               members={members}
@@ -1747,14 +1776,25 @@ function HeaderEditorModal({ theme, data, updateKid, onClose }) {
 function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updateProfilePic, pendingCount }) {
   const today = new Date().toISOString().slice(0, 10);
 
+  // Same collapsing rule as the Events tab: an identical entry on both kids'
+  // calendars shows as one row carrying both badges.
   const combinedUpcoming = useMemo(() => {
-    const merged = [];
+    const byKey = new Map();
     visibleKids.forEach((k) => {
       store[k].events
         .filter((e) => e.date >= today)
-        .forEach((e) => merged.push({ ...e, kid: THEMES[k] }));
+        .forEach((e) => {
+          const dupKey = [e.title.trim().toLowerCase(), e.date, e.time || "", e.category].join("|");
+          const hit = byKey.get(dupKey);
+          if (hit) hit.kidKeys.push(k);
+          else byKey.set(dupKey, { ...e, kidKeys: [k] });
+        });
     });
-    return merged.sort((a, b) => a.date.localeCompare(b.date)).slice(0, 6);
+    const order = Object.keys(THEMES);
+    return Array.from(byKey.values())
+      .map((e) => ({ ...e, kidKeys: e.kidKeys.slice().sort((a, b) => order.indexOf(a) - order.indexOf(b)) }))
+      .sort((a, b) => (a.date !== b.date ? a.date.localeCompare(b.date) : (a.time || "").localeCompare(b.time || "")))
+      .slice(0, 6);
   }, [store, visibleKids]);
 
   const pendingPhotos = visibleKids.reduce(
@@ -1786,7 +1826,7 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
 
       {isAdmin && perms.approvePhotos && pendingPhotos > 0 && (
         <button
-          onClick={() => setTab("gallery")}
+          onClick={() => setTab("admin")}
           style={{
             background: "#FFF4E5",
             border: "1px solid #F5D9A8",
@@ -1803,20 +1843,6 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
         </button>
       )}
 
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-        {visibleKids.map((k) => (
-          <DashKidCard
-            key={k}
-            theme={THEMES[k]}
-            data={store[k]}
-            perms={perms}
-            wide={visibleKids.length === 1}
-            onProfilePic={(dataUrl) => updateProfilePic(k, dataUrl)}
-            canEdit={isAdmin}
-          />
-        ))}
-      </div>
-
       {perms.viewEvents && (
         <SectionCard title="Coming up">
           {combinedUpcoming.length === 0 && <EmptyLine text="Nothing on the calendar yet." />}
@@ -1831,7 +1857,7 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
                 borderBottom: i < combinedUpcoming.length - 1 ? "1px solid #EEECF2" : "none",
               }}
             >
-              <KidDot kid={e.kid} />
+              <KidDots kidKeys={e.kidKeys} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 600, fontSize: 13.5 }}>{e.title}</div>
                 {(e.time || e.location) && (
@@ -1850,6 +1876,33 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
         </SectionCard>
       )}
 
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: visibleKids.length > 1 ? "1fr 1fr" : "1fr",
+          gap: 12,
+          alignItems: "start",
+        }}
+      >
+        {visibleKids.map((k) => (
+          <div key={k} style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
+            <DashKidCard
+              theme={THEMES[k]}
+              data={store[k]}
+              perms={perms}
+              wide={visibleKids.length === 1}
+              onProfilePic={(dataUrl) => updateProfilePic(k, dataUrl)}
+              canEdit={isAdmin}
+            />
+            {perms.viewEvents && (
+              <SectionCard theme={THEMES[k]} title="Next up">
+                <KidNextUp kidKey={k} data={store[k]} today={today} />
+              </SectionCard>
+            )}
+          </div>
+        ))}
+      </div>
+
       {perms.viewParty && (
         <SectionCard title="Grad party progress">
           {visibleKids.map((k) => (
@@ -1864,6 +1917,47 @@ function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updatePr
         </SectionCard>
       )}
     </div>
+  );
+}
+
+/* Renders one badge per kid an event belongs to, so a shared holiday shows
+   T and G side by side instead of appearing twice in the list. */
+/* Per-kid column content on the dashboard: their own next few dates. */
+function KidNextUp({ kidKey, data, today }) {
+  const next = (data.events || [])
+    .filter((e) => e.date >= today)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(0, 3);
+  if (next.length === 0) return <EmptyLine text="Nothing coming up." />;
+  return (
+    <>
+      {next.map((e, i) => (
+        <div
+          key={i}
+          style={{
+            padding: "7px 0",
+            borderBottom: i < next.length - 1 ? "1px solid #EEECF2" : "none",
+          }}
+        >
+          <div style={{ fontWeight: 600, fontSize: 13 }}>{e.title}</div>
+          <div style={{ fontSize: 11.5, color: "#8A8494", fontWeight: 600 }}>
+            {fmtDate(e.date)}
+            {e.time ? " · " + fmtTime(e.time) : ""}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function KidDots({ kidKeys }) {
+  const keys = kidKeys && kidKeys.length ? kidKeys : [];
+  return (
+    <span style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+      {keys.map((k) => (
+        <KidDot key={k} kid={THEMES[k]} />
+      ))}
+    </span>
   );
 }
 
@@ -2010,14 +2104,14 @@ function DashKidCard({ theme, data, perms, wide, onProfilePic, canEdit }) {
 
 function PartySummary({ theme, data }) {
   theme = theme || NEUTRAL;
-  const allItems = PARTY_CATEGORIES.flatMap((c) => c.items.map((it) => `${c.id}:${it}`));
-  const done = allItems.filter((key) => data.party[key]).length;
-  const pct = Math.round((done / allItems.length) * 100);
+  const items = data.partyItems || [];
+  const done = items.filter((it) => it.done).length;
+  const pct = items.length ? Math.round((done / items.length) * 100) : 0;
   return (
     <>
       <ProgressBar theme={theme} pct={pct} />
       <div style={{ fontSize: 13, color: theme.subtext, marginTop: 8, fontWeight: 600 }}>
-        {done} of {allItems.length} tasks done
+        {done} of {items.length} tasks done
       </div>
     </>
   );
@@ -2032,16 +2126,34 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
   const [addForKid, setAddForKid] = useState(null);   // kid key when the add modal is open
   const [quickForKid, setQuickForKid] = useState(null);
   const [selectedDay, setSelectedDay] = useState(null);
+  const [editRow, setEditRow] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
   const categories = ["All", "School", "Holiday", "Milestone", "Personal"];
   const canEdit = perms.addEvents;
 
-  // Merge both kids' events, tagging each with its kid so the UI can badge them.
+  // Merge both kids' events, collapsing identical ones (same title, date and
+  // time) into a single row that carries both kids' badges — school holidays
+  // land on both calendars and shouldn't show up twice.
   const allEvents = useMemo(() => {
-    const merged = [];
+    const byKey = new Map();
     visibleKids.forEach((k) => {
-      store[k].events.forEach((e) => merged.push({ ...e, kidKey: k }));
+      store[k].events.forEach((e) => {
+        const dupKey = [e.title.trim().toLowerCase(), e.date, e.time || "", e.category].join("|");
+        const existing = byKey.get(dupKey);
+        if (existing) {
+          existing.kidKeys.push(k);
+          existing.sources.push({ ...e, kidKey: k });
+        } else {
+          byKey.set(dupKey, { ...e, kidKeys: [k], sources: [{ ...e, kidKey: k }] });
+        }
+      });
     });
-    return merged;
+    // Keep kid order stable regardless of which one was seen first.
+    const order = Object.keys(THEMES);
+    return Array.from(byKey.values()).map((e) => ({
+      ...e,
+      kidKeys: e.kidKeys.slice().sort((a, b) => order.indexOf(a) - order.indexOf(b)),
+    }));
   }, [store, visibleKids]);
 
   const filteredEvents = useMemo(
@@ -2050,7 +2162,10 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
   );
 
   const grouped = useMemo(() => {
-    const sorted = [...filteredEvents].sort((a, b) => a.date.localeCompare(b.date));
+    const sorted = [...filteredEvents].sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      return (a.time || "").localeCompare(b.time || "");
+    });
     const groups = {};
     sorted.forEach((e) => {
       const key = monthLabel(e.date);
@@ -2062,16 +2177,33 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
 
   function addEvent(kidKey, newEvent) {
     const addedBy = currentUser ? currentUser.name || currentUser.email : null;
-    updateKidData(kidKey, (d) => ({ ...d, events: [...d.events, { ...newEvent, addedBy }] }));
+    const id = "e" + Date.now() + Math.random().toString(36).slice(2, 6);
+    updateKidData(kidKey, (d) => ({ ...d, events: [...d.events, { ...newEvent, id, addedBy }] }));
     setAddForKid(null);
     setQuickForKid(null);
   }
 
-  function removeEvent(target) {
-    updateKidData(target.kidKey, (d) => ({
-      ...d,
-      events: d.events.filter((e) => !(e.date === target.date && e.title === target.title)),
-    }));
+  // Editing a collapsed row updates every underlying copy, so a shared
+  // holiday stays in sync across both kids.
+  function saveEdit(originalRow, updated) {
+    (originalRow.sources || [originalRow]).forEach((src) => {
+      updateKidData(src.kidKey, (d) => ({
+        ...d,
+        events: d.events.map((e) => (sameEvent(e, src) ? { ...e, ...updated } : e)),
+      }));
+    });
+    setEditRow(null);
+  }
+
+  function removeEvent(row) {
+    (row.sources || [row]).forEach((src) => {
+      updateKidData(src.kidKey, (d) => ({
+        ...d,
+        events: d.events.filter((e) => !sameEvent(e, src)),
+      }));
+    });
+    setConfirmDelete(null);
+    setEditRow(null);
   }
 
   // When only one kid is in view, adding is unambiguous; otherwise ask which kid.
@@ -2169,11 +2301,15 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
                       borderBottom: i < events.length - 1 ? "1px solid #EEECF2" : "none",
                     }}
                   >
-                    <KidDot kid={THEMES[e.kidKey]} />
+                    <KidDots kidKeys={e.kidKeys} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{e.title}</div>
                       <div style={{ fontSize: 12.5, color: "#8A8494", fontWeight: 600, marginTop: 1 }}>
-                        {fmtDate(e.date)} · {e.time ? fmtTime(e.time) : "All day"} · {e.category}
+                        {fmtDate(e.date)} ·{" "}
+                        {e.time
+                          ? fmtTime(e.time) + (e.endTime ? " – " + fmtTime(e.endTime) : "")
+                          : "All day"}{" "}
+                        · {e.category}
                       </div>
                       {e.location && (
                         <div style={{ fontSize: 12, color: "#8A8494", marginTop: 1 }}>📍 {e.location}</div>
@@ -2188,21 +2324,47 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
                           Added by {e.addedBy}
                         </div>
                       )}
+                      {e.kidKeys.length > 1 && (
+                        <div style={{ fontSize: 11, color: "#A19DAF", marginTop: 2 }}>
+                          On both calendars — edits apply to both
+                        </div>
+                      )}
                     </div>
-                    {canEdit && e.custom && (
-                      <button
-                        onClick={() => removeEvent(e)}
-                        style={{
-                          background: "none",
-                          border: "none",
-                          color: "#8A8494",
-                          fontSize: 13,
-                          cursor: "pointer",
-                        }}
-                        aria-label="Remove event"
-                      >
-                        ✕
-                      </button>
+                    {canEdit && (
+                      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                        <button
+                          onClick={() => setEditRow(e)}
+                          title="Edit"
+                          style={{
+                            background: "none",
+                            border: "1px solid #E0DCE8",
+                            borderRadius: 6,
+                            color: "#4B2E83",
+                            fontSize: 11,
+                            padding: "4px 8px",
+                            cursor: "pointer",
+                            fontWeight: 700,
+                          }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => setConfirmDelete(e)}
+                          title="Delete"
+                          style={{
+                            background: "none",
+                            border: "1px solid #E8B4B4",
+                            borderRadius: 6,
+                            color: "#8A2E2E",
+                            fontSize: 11,
+                            padding: "4px 8px",
+                            cursor: "pointer",
+                            fontWeight: 700,
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
                     )}
                   </div>
                 ))}
@@ -2237,6 +2399,31 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
         )
       )}
 
+      {editRow && (
+        <AddEventModal
+          theme={THEMES[editRow.kidKeys[0]]}
+          existing={editRow}
+          onClose={() => setEditRow(null)}
+          onAdd={(updated) => saveEdit(editRow, updated)}
+          settings={settings}
+        />
+      )}
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete this event?"
+          body={
+            confirmDelete.title +
+            (confirmDelete.kidKeys.length > 1
+              ? " — this will remove it from both kids' calendars."
+              : "")
+          }
+          confirmLabel="Yes, delete"
+          onConfirm={() => removeEvent(confirmDelete)}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+
       {quickForKid && (
         quickForKid === "__ask" ? (
           <PickKidModal
@@ -2257,6 +2444,70 @@ function EventsTab({ store, visibleKids, updateKidData, settings, perms, current
 }
 
 /* Small chooser used whenever an action needs to know which kid it applies to. */
+/* Shared yes/no confirmation so destructive actions never fire on a stray tap. */
+function ConfirmModal({ title, body, confirmLabel, onConfirm, onCancel }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.5)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 97,
+        padding: 20,
+        boxSizing: "border-box",
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: "#fff", borderRadius: 16, padding: 20, width: "100%", maxWidth: 340 }}
+      >
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>{title}</div>
+        {body && (
+          <div style={{ fontSize: 13, color: "#565064", marginBottom: 16, lineHeight: 1.5 }}>{body}</div>
+        )}
+        <div style={{ display: "flex", gap: 10 }}>
+          <button
+            onClick={onCancel}
+            style={{
+              flex: 1,
+              background: "transparent",
+              border: "1.5px solid #E0DCE8",
+              borderRadius: 9,
+              padding: "11px 0",
+              fontWeight: 700,
+              fontSize: 13.5,
+              cursor: "pointer",
+              color: "#565064",
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            style={{
+              flex: 1,
+              background: "#B33A3A",
+              border: "none",
+              borderRadius: 9,
+              padding: "11px 0",
+              fontWeight: 700,
+              fontSize: 13.5,
+              cursor: "pointer",
+              color: "#fff",
+            }}
+          >
+            {confirmLabel || "Confirm"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PickKidModal({ title, onPick, onClose }) {
   return (
     <div
@@ -2449,7 +2700,7 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
                         width: 4,
                         height: 4,
                         borderRadius: "50%",
-                        background: isSelected ? theme.onPrimary : (e.kidKey ? THEMES[e.kidKey].primary : (CATEGORY_COLORS[e.category] || theme.primary)),
+                        background: isSelected ? theme.onPrimary : (e.kidKeys && e.kidKeys.length ? THEMES[e.kidKeys[0]].primary : (CATEGORY_COLORS[e.category] || theme.primary)),
                       }}
                     />
                   ))}
@@ -2479,8 +2730,8 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
                     borderBottom: i < eventsByDay[selectedDay].length - 1 ? `1px solid ${theme.border}` : "none",
                   }}
                 >
-                  {e.kidKey ? (
-                    <KidDot kid={THEMES[e.kidKey]} />
+                  {e.kidKeys ? (
+                    <KidDots kidKeys={e.kidKeys} />
                   ) : (
                     <div
                       style={{
@@ -2501,7 +2752,7 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
                       <div style={{ fontSize: 11.5, color: theme.subtext, marginTop: 1 }}>📍 {e.location}</div>
                     )}
                   </div>
-                  {!familyView && e.custom && (
+                  {!familyView && (
                     <button
                       onClick={() => removeEvent(e)}
                       style={{ background: "none", border: "none", color: theme.subtext, cursor: "pointer" }}
@@ -2535,16 +2786,17 @@ function navBtnStyle(theme) {
 }
 
 /* ---------- Add-event modal ---------- */
-function AddEventModal({ theme, onClose, onAdd, settings, onOpenReminders }) {
-  const [title, setTitle] = useState("");
-  const [date, setDate] = useState("");
-  const [category, setCategory] = useState("Personal");
-  const [allDay, setAllDay] = useState(true);
-  const [time, setTime] = useState("");
-  const [location, setLocation] = useState("");
-  const [reminderOn, setReminderOn] = useState(false);
-  const [timing, setTiming] = useState("1-day");
-  const [recipients, setRecipients] = useState([]);
+function AddEventModal({ theme, onClose, onAdd, settings, onOpenReminders, existing }) {
+  const ed = existing || {};
+  const [title, setTitle] = useState(ed.title || "");
+  const [date, setDate] = useState(ed.date || "");
+  const [category, setCategory] = useState(ed.category || "Personal");
+  const [allDay, setAllDay] = useState(ed.time ? false : true);
+  const [time, setTime] = useState(ed.time || "");
+  const [location, setLocation] = useState(ed.location || "");
+  const [reminderOn, setReminderOn] = useState(!!(ed.reminder && ed.reminder.enabled));
+  const [timing, setTiming] = useState((ed.reminder && ed.reminder.timing) || "1-day");
+  const [recipients, setRecipients] = useState((ed.reminder && ed.reminder.recipients) || []);
 
   const phoneNumbers = (settings && settings.phoneNumbers) || [];
 
@@ -2596,7 +2848,9 @@ function AddEventModal({ theme, onClose, onAdd, settings, onOpenReminders }) {
           boxSizing: "border-box",
         }}
       >
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 14 }}>Add an event</div>
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 14 }}>
+          {existing ? "Edit event" : "Add an event"}
+        </div>
 
         <FieldLabel theme={theme}>Title</FieldLabel>
         <input
@@ -2771,7 +3025,7 @@ function AddEventModal({ theme, onClose, onAdd, settings, onOpenReminders }) {
               cursor: title.trim() && date ? "pointer" : "not-allowed",
             }}
           >
-            Add event
+            {existing ? "Save changes" : "Add event"}
           </button>
         </div>
       </div>
@@ -2780,113 +3034,169 @@ function AddEventModal({ theme, onClose, onAdd, settings, onOpenReminders }) {
 }
 
 /* ---------- Quick Add — freeform event entry via the Claude API ---------- */
-async function callQuickAddAssistant(history) {
-  const todayObj = new Date();
-  const todayISO = todayObj.toISOString().slice(0, 10);
-  const todayHuman = todayObj.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-  const system =
-    `You convert a parent's freeform, casual description of a single event into structured JSON ` +
-    `for a family calendar app called Senior Year Hub. Today is ${todayHuman} (${todayISO}). ` +
-    `When the description gives a date without a year (e.g. "Sat Aug 8"), pick the closest upcoming ` +
-    `occurrence of that weekday/date from today. Respond with ONLY raw JSON, no markdown fences, no ` +
-    `commentary, matching exactly one of these two shapes:\n` +
-    `{"type":"event","title":"short title","date":"YYYY-MM-DD","allDay":true,"time":null,"location":"..."|null,"category":"School"|"Personal"|"Milestone"|"Holiday","confirm":"one short friendly sentence confirming what will be added; if location is missing, say so"}\n` +
-    `or\n` +
-    `{"type":"question","text":"one short clarifying question"}\n` +
-    `Ask a clarifying question if the date is missing or ambiguous, or if there's no location mentioned ` +
-    `for an event that would typically have one (skip this for holidays, reminders, or deadlines). Never ` +
-    `ask more than one clarifying question about the same missing detail — if it's still missing after ` +
-    `being asked once, proceed with your best guess and set that field to null instead of asking again. ` +
-    `If a time range is given (e.g. "9am-1pm"), use the start time and mention the end time in "confirm".`;
+/* ---------- Local natural-language event parser ----------
+   Runs entirely in the browser: no API key, no network, no cost, and it
+   keeps working on GitHub Pages. Deterministic, so what you see in the
+   preview is exactly what gets saved. */
+const MONTHS = {
+  jan:0, january:0, feb:1, february:1, mar:2, march:2, apr:3, april:3,
+  may:4, jun:5, june:5, jul:6, july:6, aug:7, august:7, sep:8, sept:8,
+  september:8, oct:9, october:9, nov:10, november:10, dec:11, december:11,
+};
+const WEEKDAYS = {
+  sun:0, sunday:0, mon:1, monday:1, tue:2, tues:2, tuesday:2, wed:3,
+  wednesday:3, thu:4, thur:4, thurs:4, thursday:4, fri:5, friday:5,
+  sat:6, saturday:6,
+};
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      system,
-      messages: history.map((m) => ({ role: m.role, content: m.text })),
-    }),
-  });
-  const data = await response.json();
-  const text = (data.content || []).map((c) => c.text || "").join("");
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+function toISO(d) {
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
 }
 
-function QuickAddModal({ theme, onClose, onAdd }) {
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      text:
-        'Tell me about the event and I\'ll fill it in — try something like "Senior parking lot painting Sat Aug 8 9am-1pm at the HS lot."',
-    },
-  ]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [pendingEvent, setPendingEvent] = useState(null);
-  const scrollRef = useRef(null);
+function to24h(hour, min, meridiem) {
+  let h = hour;
+  if (meridiem === "pm" && h !== 12) h += 12;
+  if (meridiem === "am" && h === 12) h = 0;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
 
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, loading]);
+function parseEventText(text, today) {
+  const now = today ? new Date(today) : new Date();
+  now.setHours(0, 0, 0, 0);
+  let rest = " " + text.trim() + " ";
+  const found = { date: null, time: null, endTime: null, location: null };
 
-  async function send() {
-    const text = input.trim();
-    if (!text || loading) return;
-    const withUser = [...messages, { role: "user", text }];
-    setMessages(withUser);
-    setInput("");
-    setLoading(true);
-    try {
-      const result = await callQuickAddAssistant(
-        withUser.map((m) => ({ role: m.role, text: m.apiText || m.text }))
-      );
-      if (result.type === "question") {
-        setPendingEvent(null);
-        setMessages((prev) => [...prev, { role: "assistant", text: result.text }]);
-      } else if (result.type === "event") {
-        setPendingEvent(result);
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", text: result.confirm, kind: "confirm", apiText: JSON.stringify(result) },
-        ]);
+  /* --- time first, so "at 7pm" doesn't get mistaken for a location --- */
+  // range: 9am-1pm / 9:30am - 1:00pm / 9-1pm
+  const rangeRe = /\s(?:from\s+|at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|to|until|til)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i;
+  const rangeM = rest.match(rangeRe);
+  if (rangeM) {
+    const endMer = rangeM[6].toLowerCase();
+    const startMer = (rangeM[3] || endMer).toLowerCase();
+    found.time = to24h(parseInt(rangeM[1],10), parseInt(rangeM[2]||"0",10), startMer);
+    found.endTime = to24h(parseInt(rangeM[4],10), parseInt(rangeM[5]||"0",10), endMer);
+    rest = rest.replace(rangeM[0], " ");
+  } else {
+    const singleRe = /\s(?:at\s+|@\s*)?(\d{1,2})(?::(\d{2}))\s*(am|pm)?\b|\s(?:at\s+|@\s*)?(\d{1,2})\s*(am|pm)\b/i;
+    const sm = rest.match(singleRe);
+    if (sm) {
+      if (sm[1] !== undefined) {
+        const mer = (sm[3] || (parseInt(sm[1],10) < 8 ? "pm" : "am")).toLowerCase();
+        found.time = to24h(parseInt(sm[1],10), parseInt(sm[2],10), mer);
       } else {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", text: "Sorry, I didn't quite catch that — can you try rephrasing?" },
-        ]);
+        found.time = to24h(parseInt(sm[4],10), 0, sm[5].toLowerCase());
       }
-    } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", text: "Hmm, something went wrong reaching the assistant. Try again?" },
-      ]);
-    } finally {
-      setLoading(false);
+      rest = rest.replace(sm[0], " ");
     }
   }
 
-  function confirmAdd() {
-    if (!pendingEvent) return;
-    const isAllDay = pendingEvent.allDay !== false;
+  /* --- date --- */
+  // explicit: Aug 8 / August 8th, 2027 / Aug 8 2027
+  const monthNames = Object.keys(MONTHS).join("|");
+  const monthRe = new RegExp(`\\s(${monthNames})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s*(\\d{4}))?\\b`, "i");
+  // numeric: 8/8 or 8/8/27 or 8-8-2027
+  const numRe = /\s(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/;
+  const relRe = /\s(today|tomorrow|tonight)\b/i;
+  const weekdayNames = Object.keys(WEEKDAYS).join("|");
+  const weekdayRe = new RegExp(`\\s(?:(next|this)\\s+)?(${weekdayNames})\\b`, "i");
+
+  const mm = rest.match(monthRe);
+  const nm = rest.match(numRe);
+  const rm = rest.match(relRe);
+  const wm = rest.match(weekdayRe);
+
+  if (mm) {
+    const month = MONTHS[mm[1].toLowerCase()];
+    const day = parseInt(mm[2], 10);
+    let year = mm[3] ? parseInt(mm[3], 10) : now.getFullYear();
+    if (!mm[3]) {
+      const candidate = new Date(year, month, day);
+      if (candidate < now) year += 1;   // no year given -> next occurrence
+    }
+    found.date = toISO(new Date(year, month, day));
+    rest = rest.replace(mm[0], " ");
+  } else if (nm) {
+    const month = parseInt(nm[1], 10) - 1;
+    const day = parseInt(nm[2], 10);
+    let year = now.getFullYear();
+    if (nm[3]) {
+      year = parseInt(nm[3], 10);
+      if (year < 100) year += 2000;
+    } else {
+      const candidate = new Date(year, month, day);
+      if (candidate < now) year += 1;
+    }
+    found.date = toISO(new Date(year, month, day));
+    rest = rest.replace(nm[0], " ");
+  } else if (rm) {
+    const word = rm[1].toLowerCase();
+    const d = new Date(now);
+    if (word === "tomorrow") d.setDate(d.getDate() + 1);
+    found.date = toISO(d);
+    rest = rest.replace(rm[0], " ");
+  } else if (wm) {
+    const target = WEEKDAYS[wm[2].toLowerCase()];
+    const d = new Date(now);
+    let delta = (target - d.getDay() + 7) % 7;
+    if (delta === 0) delta = 7;                       // "sat" on a Sat = next Sat
+    if (wm[1] && wm[1].toLowerCase() === "next" && delta < 7) delta += 0;
+    d.setDate(d.getDate() + delta);
+    found.date = toISO(d);
+    rest = rest.replace(wm[0], " ");
+  }
+
+  // A bare weekday alongside an explicit date is just noise ("Sat Aug 8").
+  if (found.date && wm && rest.match(weekdayRe)) {
+    rest = rest.replace(weekdayRe, " ");
+  }
+
+  /* --- location: trailing "at ..." / "@ ..." / "in ..." --- */
+  const locRe = /\s(?:at|@|in)\s+(.+?)\s*$/i;
+  const lm = rest.match(locRe);
+  if (lm && lm[1].trim().length > 1) {
+    found.location = lm[1].trim().replace(/[.,;]+$/, "");
+    rest = rest.replace(lm[0], " ");
+  }
+
+  /* --- whatever's left is the title --- */
+  let title = rest
+    .replace(/\s+(on|from|the)\s*$/i, " ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s,\-–]+|[\s,\-–]+$/g, "")
+    .trim();
+  if (title) title = title.charAt(0).toUpperCase() + title.slice(1);
+
+  return {
+    title,
+    date: found.date,
+    time: found.time,
+    endTime: found.endTime,
+    location: found.location,
+    allDay: !found.time,
+  };
+}
+
+function QuickAddModal({ theme, onClose, onAdd }) {
+  const [text, setText] = useState("");
+  const [category, setCategory] = useState("Personal");
+  const parsed = useMemo(() => (text.trim() ? parseEventText(text) : null), [text]);
+  const ready = !!(parsed && parsed.title && parsed.date);
+
+  function submit() {
+    if (!ready) return;
     onAdd({
-      title: pendingEvent.title,
-      date: pendingEvent.date,
-      category: pendingEvent.category || "Personal",
+      title: parsed.title,
+      date: parsed.date,
+      category,
       custom: true,
-      allDay: isAllDay,
-      time: isAllDay ? null : pendingEvent.time || null,
-      location: pendingEvent.location || null,
+      allDay: parsed.allDay,
+      time: parsed.time || null,
+      endTime: parsed.endTime || null,
+      location: parsed.location || null,
       reminder: { enabled: false, timing: "1-day", recipients: [] },
     });
-    onClose();
   }
 
   return (
@@ -2912,9 +3222,8 @@ function QuickAddModal({ theme, onClose, onAdd }) {
           width: "100%",
           maxWidth: 440,
           maxHeight: "85vh",
-          display: "flex",
-          flexDirection: "column",
-          overflow: "hidden",
+          overflowY: "auto",
+          boxSizing: "border-box",
         }}
       >
         <div
@@ -2929,7 +3238,7 @@ function QuickAddModal({ theme, onClose, onAdd }) {
             alignItems: "center",
           }}
         >
-          💬 Quick add
+          💬 Quick add — {theme.name}
           <button
             onClick={onClose}
             style={{ background: "none", border: "none", color: "#fff", fontSize: 18, cursor: "pointer" }}
@@ -2938,100 +3247,122 @@ function QuickAddModal({ theme, onClose, onAdd }) {
           </button>
         </div>
 
-        <div
-          ref={scrollRef}
-          style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}
-        >
-          {messages.map((m, i) => (
-            <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: m.role === "user" ? "flex-end" : "flex-start" }}>
-              <div
-                style={{
-                  maxWidth: "82%",
-                  background: m.role === "user" ? theme.primary : "#F1EFF5",
-                  color: m.role === "user" ? theme.onPrimary : "#232028",
-                  borderRadius: 12,
-                  padding: "10px 13px",
-                  fontSize: 13.5,
-                  lineHeight: 1.4,
-                }}
-              >
-                {m.text}
+        <div style={{ padding: 18 }}>
+          <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
+            Type it however you'd say it. Try{" "}
+            <em>"Senior parking lot painting Sat Aug 8 9am-1pm at the HS lot"</em>.
+          </div>
+
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Describe the event…"
+            rows={3}
+            autoFocus
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              border: "1.5px solid #E0DCE8",
+              borderRadius: 9,
+              padding: "11px 13px",
+              fontSize: 14,
+              fontFamily: "inherit",
+              resize: "vertical",
+              marginBottom: 14,
+            }}
+          />
+
+          {text.trim() && (
+            <div
+              style={{
+                border: `1px solid ${ready ? "#D9D2EC" : "#F5D9A8"}`,
+                background: ready ? "#F7F5FB" : "#FFF9EF",
+                borderRadius: 10,
+                padding: 13,
+                marginBottom: 14,
+              }}
+            >
+              <div style={{ fontSize: 10.5, fontWeight: 800, color: "#8A8494", marginBottom: 8, letterSpacing: 0.5 }}>
+                WHAT I GOT
               </div>
-              {m.kind === "confirm" && pendingEvent && i === messages.length - 1 && (
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                  <button
-                    onClick={confirmAdd}
-                    style={{
-                      background: theme.primary,
-                      color: theme.onPrimary,
-                      border: "none",
-                      borderRadius: 8,
-                      padding: "7px 12px",
-                      fontSize: 12.5,
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    ✅ Add to calendar
-                  </button>
-                  <button
-                    onClick={() => setPendingEvent(null)}
-                    style={{
-                      background: "transparent",
-                      color: theme.subtext,
-                      border: `1px solid ${theme.border}`,
-                      borderRadius: 8,
-                      padding: "7px 12px",
-                      fontSize: 12.5,
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    ✏️ Keep editing
-                  </button>
+              <ReviewRow label="Title" value={parsed.title || "—"} />
+              <ReviewRow label="Date" value={parsed.date ? fmtDate(parsed.date) : "—"} />
+              <ReviewRow
+                label="Time"
+                value={
+                  parsed.time
+                    ? fmtTime(parsed.time) + (parsed.endTime ? " – " + fmtTime(parsed.endTime) : "")
+                    : "All day"
+                }
+              />
+              <ReviewRow label="Location" value={parsed.location || "—"} />
+              {!ready && (
+                <div style={{ fontSize: 11.5, color: "#7A5A1A", marginTop: 8, lineHeight: 1.5 }}>
+                  ⚠ I still need {!parsed.title ? "a title" : ""}
+                  {!parsed.title && !parsed.date ? " and " : ""}
+                  {!parsed.date ? "a date" : ""}. Try adding it, e.g. "Aug 8" or "next Friday".
                 </div>
               )}
             </div>
-          ))}
-          {loading && (
-            <div style={{ alignSelf: "flex-start", fontSize: 12.5, color: "#8A8494", fontStyle: "italic" }}>
-              Thinking…
-            </div>
           )}
-        </div>
 
-        <div style={{ borderTop: `1px solid ${theme.border}`, padding: 12, display: "flex", gap: 8 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && send()}
-            placeholder="Describe the event…"
-            style={{
-              flex: 1,
-              border: `1.5px solid ${theme.border}`,
-              borderRadius: 9,
-              padding: "10px 12px",
-              fontSize: 13.5,
-              fontFamily: "inherit",
-            }}
-          />
-          <button
-            onClick={send}
-            disabled={loading || !input.trim()}
-            style={{
-              background: theme.primary,
-              color: theme.onPrimary,
-              border: "none",
-              borderRadius: 9,
-              padding: "0 16px",
-              fontWeight: 800,
-              fontSize: 13.5,
-              cursor: loading || !input.trim() ? "not-allowed" : "pointer",
-              opacity: loading || !input.trim() ? 0.6 : 1,
-            }}
-          >
-            Send
-          </button>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 8 }}>Category</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+            {["Personal", "School", "Milestone", "Holiday"].map((c) => (
+              <button
+                key={c}
+                onClick={() => setCategory(c)}
+                style={{
+                  border: `1.5px solid ${category === c ? theme.primary : "#E0DCE8"}`,
+                  background: category === c ? theme.primary : "transparent",
+                  color: category === c ? theme.onPrimary : "#565064",
+                  borderRadius: 20,
+                  padding: "6px 13px",
+                  fontSize: 12.5,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                {c}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              onClick={onClose}
+              style={{
+                flex: 1,
+                background: "transparent",
+                border: "1.5px solid #E0DCE8",
+                borderRadius: 9,
+                padding: "12px 0",
+                fontWeight: 700,
+                fontSize: 14,
+                cursor: "pointer",
+                color: "#565064",
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={submit}
+              disabled={!ready}
+              style={{
+                flex: 2,
+                background: ready ? theme.primary : "#E7E1F5",
+                color: ready ? theme.onPrimary : "#A8A2BC",
+                border: "none",
+                borderRadius: 9,
+                padding: "12px 0",
+                fontWeight: 800,
+                fontSize: 14,
+                cursor: ready ? "pointer" : "not-allowed",
+              }}
+            >
+              Add to calendar
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -3087,8 +3418,9 @@ function GalleryTab({ store, visibleKids, updateKidData, perms, currentUser, set
     return merged;
   }, [store, visibleKids]);
 
+  // Only approved photos ever reach this tab — the review queue lives on the
+  // Admin page so pending submissions aren't visible to the whole family.
   const approvedAll = allPhotos.filter((p) => p.approved);
-  const pending = allPhotos.filter((p) => !p.approved);
   const approved =
     filterTag === "All" ? approvedAll : approvedAll.filter((p) => (p.tags || []).includes(filterTag));
   const activeSlideshowSet = slideshowPhotos || approved;
@@ -3278,85 +3610,6 @@ function GalleryTab({ store, visibleKids, updateKidData, perms, currentUser, set
         >
           {driveNote}
         </div>
-      )}
-
-      {canModerate && pending.length > 0 && (
-        <SectionCard title={`Pending approval (${pending.length})`}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            {pending.map((p) => (
-              <div key={p.id} style={{ borderRadius: 10, overflow: "hidden", border: "1px solid #E7E4EE" }}>
-                <div style={{ position: "relative" }}>
-                  <PhotoImg src={p.url} style={{ width: "100%", height: 110, objectFit: "cover" }} />
-                  <div style={{ position: "absolute", top: 5, left: 5 }}>
-                    <KidDot kid={THEMES[p.kidKey]} />
-                  </div>
-                </div>
-                <div style={{ padding: 8 }}>
-                  {p.caption && (
-                    <div style={{ fontSize: 12, marginBottom: 6, color: "#8A8494" }}>{p.caption}</div>
-                  )}
-                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
-                    {PHOTO_TAGS.map((tag) => {
-                      const active = (p.tags || []).includes(tag.id);
-                      return (
-                        <button
-                          key={tag.id}
-                          onClick={() => toggleTagOnPhoto(p, tag.id)}
-                          style={{
-                            border: `1px solid ${active ? "#4B2E83" : "#E0DCE8"}`,
-                            background: active ? "#4B2E83" : "transparent",
-                            color: active ? "#fff" : "#8A8494",
-                            borderRadius: 12,
-                            padding: "2px 8px",
-                            fontSize: 10.5,
-                            fontWeight: 700,
-                            cursor: "pointer",
-                          }}
-                        >
-                          {tag.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button
-                      onClick={() => approve(p)}
-                      style={{
-                        flex: 1,
-                        background: "#2E7D32",
-                        color: "#fff",
-                        border: "none",
-                        borderRadius: 6,
-                        padding: "6px 0",
-                        fontSize: 12,
-                        fontWeight: 700,
-                        cursor: "pointer",
-                      }}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      onClick={() => reject(p)}
-                      style={{
-                        flex: 1,
-                        background: "transparent",
-                        color: "#8A8494",
-                        border: "1px solid #E0DCE8",
-                        borderRadius: 6,
-                        padding: "6px 0",
-                        fontSize: 12,
-                        fontWeight: 700,
-                        cursor: "pointer",
-                      }}
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </SectionCard>
       )}
 
       <div style={{ display: "flex", gap: 8, marginBottom: 14, marginTop: 14, flexWrap: "wrap" }}>
@@ -3954,64 +4207,12 @@ function PartyTab({ store, visibleKids, updateKidData, perms }) {
             </div>
 
             {view === "checklist" || !canSeeBudget ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                {PARTY_CATEGORIES.map((cat) => {
-                  const doneCount = cat.items.filter((it) => data.party[`${cat.id}:${it}`]).length;
-                  return (
-                    <SectionCard
-                      key={cat.id}
-                      theme={theme}
-                      title={cat.label}
-                      right={
-                        <span style={{ fontSize: 12, fontWeight: 700, color: theme.subtext }}>
-                          {doneCount}/{cat.items.length}
-                        </span>
-                      }
-                    >
-                      {cat.items.map((item, i) => {
-                        const key = `${cat.id}:${item}`;
-                        const checked = !!data.party[key];
-                        return (
-                          <label
-                            key={key}
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 10,
-                              padding: "8px 0",
-                              cursor: canEdit ? "pointer" : "default",
-                              borderBottom: i < cat.items.length - 1 ? `1px solid ${theme.border}` : "none",
-                            }}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              disabled={!canEdit}
-                              onChange={() =>
-                                updateKidData(kidKey, (d) => ({
-                                  ...d,
-                                  party: { ...d.party, [key]: !d.party[key] },
-                                }))
-                              }
-                              style={{ width: 18, height: 18, accentColor: theme.primary }}
-                            />
-                            <span
-                              style={{
-                                fontSize: 14,
-                                fontWeight: 600,
-                                textDecoration: checked ? "line-through" : "none",
-                                color: checked ? theme.subtext : theme.text,
-                              }}
-                            >
-                              {item}
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </SectionCard>
-                  );
-                })}
-              </div>
+              <PartyChecklist
+                theme={theme}
+                data={data}
+                canEdit={canEdit}
+                updateKid={(updater) => updateKidData(kidKey, updater)}
+              />
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <BudgetView
@@ -4027,6 +4228,227 @@ function PartyTab({ store, visibleKids, updateKidData, perms }) {
       })}
     </div>
   );
+}
+
+/* Full CRUD checklist: add, rename, check off, delete — per category. */
+function PartyChecklist({ theme, data, canEdit, updateKid }) {
+  const [addingTo, setAddingTo] = useState(null);
+  const [newLabel, setNewLabel] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editLabel, setEditLabel] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+
+  const items = data.partyItems || [];
+
+  function addItem(categoryId) {
+    const label = newLabel.trim();
+    if (!label) return;
+    const id = "pi" + Date.now() + Math.random().toString(36).slice(2, 6);
+    updateKid((d) => ({
+      ...d,
+      partyItems: [...(d.partyItems || []), { id, categoryId, label, done: false }],
+    }));
+    setNewLabel("");
+    setAddingTo(null);
+  }
+
+  function renameItem(id) {
+    const label = editLabel.trim();
+    if (!label) return;
+    updateKid((d) => ({
+      ...d,
+      partyItems: (d.partyItems || []).map((it) => (it.id === id ? { ...it, label } : it)),
+    }));
+    setEditingId(null);
+  }
+
+  function toggleItem(id) {
+    if (!canEdit) return;
+    updateKid((d) => ({
+      ...d,
+      partyItems: (d.partyItems || []).map((it) => (it.id === id ? { ...it, done: !it.done } : it)),
+    }));
+  }
+
+  function deleteItem(id) {
+    updateKid((d) => ({ ...d, partyItems: (d.partyItems || []).filter((it) => it.id !== id) }));
+    setConfirmDelete(null);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {PARTY_CATEGORIES.map((cat) => {
+        const catItems = items.filter((it) => it.categoryId === cat.id);
+        const doneCount = catItems.filter((it) => it.done).length;
+        return (
+          <SectionCard
+            key={cat.id}
+            theme={theme}
+            title={cat.label}
+            right={
+              <span style={{ fontSize: 12, fontWeight: 700, color: theme.subtext }}>
+                {doneCount}/{catItems.length}
+              </span>
+            }
+          >
+            {catItems.length === 0 && <EmptyLine text="Nothing here yet." />}
+
+            {catItems.map((it, i) => (
+              <div
+                key={it.id}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  padding: "8px 0",
+                  borderBottom: i < catItems.length - 1 ? `1px solid ${theme.border}` : "none",
+                }}
+              >
+                {editingId === it.id ? (
+                  <>
+                    <input
+                      value={editLabel}
+                      onChange={(e) => setEditLabel(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && renameItem(it.id)}
+                      autoFocus
+                      style={{
+                        flex: 1,
+                        border: `1.5px solid ${theme.primary}`,
+                        borderRadius: 7,
+                        padding: "7px 10px",
+                        fontSize: 13.5,
+                        fontFamily: "inherit",
+                      }}
+                    />
+                    <button onClick={() => renameItem(it.id)} style={miniActionStyle(theme, true)}>
+                      Save
+                    </button>
+                    <button onClick={() => setEditingId(null)} style={miniActionStyle(theme, false)}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      type="checkbox"
+                      checked={it.done}
+                      disabled={!canEdit}
+                      onChange={() => toggleItem(it.id)}
+                      style={{ width: 18, height: 18, accentColor: theme.primary, flexShrink: 0 }}
+                    />
+                    <span
+                      style={{
+                        flex: 1,
+                        fontSize: 14,
+                        fontWeight: 600,
+                        textDecoration: it.done ? "line-through" : "none",
+                        color: it.done ? theme.subtext : theme.text,
+                        minWidth: 0,
+                      }}
+                    >
+                      {it.label}
+                    </span>
+                    {canEdit && (
+                      <span style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                        <button
+                          onClick={() => {
+                            setEditingId(it.id);
+                            setEditLabel(it.label);
+                          }}
+                          style={miniActionStyle(theme, false)}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => setConfirmDelete(it)}
+                          style={{ ...miniActionStyle(theme, false), color: "#8A2E2E", borderColor: "#E8B4B4" }}
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
+            ))}
+
+            {canEdit &&
+              (addingTo === cat.id ? (
+                <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                  <input
+                    value={newLabel}
+                    onChange={(e) => setNewLabel(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && addItem(cat.id)}
+                    placeholder="New task…"
+                    autoFocus
+                    style={{
+                      flex: 1,
+                      border: `1.5px solid ${theme.primary}`,
+                      borderRadius: 7,
+                      padding: "8px 10px",
+                      fontSize: 13.5,
+                      fontFamily: "inherit",
+                    }}
+                  />
+                  <button onClick={() => addItem(cat.id)} style={miniActionStyle(theme, true)}>
+                    Add
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAddingTo(null);
+                      setNewLabel("");
+                    }}
+                    style={miniActionStyle(theme, false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setAddingTo(cat.id)}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: theme.primary,
+                    fontWeight: 700,
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                    padding: 0,
+                    marginTop: 10,
+                  }}
+                >
+                  + Add task
+                </button>
+              ))}
+          </SectionCard>
+        );
+      })}
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete this task?"
+          body={confirmDelete.label}
+          confirmLabel="Yes, delete"
+          onConfirm={() => deleteItem(confirmDelete.id)}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function miniActionStyle(theme, filled) {
+  return {
+    border: `1px solid ${filled ? theme.primary : "#E0DCE8"}`,
+    background: filled ? theme.primary : "transparent",
+    color: filled ? theme.onPrimary : theme.primary,
+    borderRadius: 6,
+    padding: "5px 10px",
+    fontSize: 11.5,
+    fontWeight: 700,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  };
 }
 
 function BudgetView({ theme, data, updateKid, familyView }) {
@@ -4738,6 +5160,9 @@ function BottomNav({ tab, setTab, perms, isAdmin, pendingCount }) {
    reminder numbers, and sync status all live here.
    ============================================================ */
 function AdminPage({
+  store,
+  updateKidData,
+  currentUser,
   settings,
   updateSettings,
   members,
@@ -4750,12 +5175,57 @@ function AdminPage({
   onSetPermissions,
   onSwitchMember,
 }) {
-  const [section, setSection] = useState("people");
+  const [section, setSection] = useState("review");
+  const [driveNote, setDriveNote] = useState("");
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const phoneNumbers = settings.phoneNumbers || [];
 
   const pending = members.filter((m) => m.status === "pending");
+
+  // Pending photos across both kids — this is the only place they're visible.
+  const pendingPhotos = Object.keys(THEMES).flatMap((k) =>
+    (store[k].photos || []).filter((p) => !p.approved).map((p) => ({ ...p, kidKey: k }))
+  );
+  const reviewCount = pending.length + pendingPhotos.length;
+  const syncUrl = (settings && settings.syncUrl) || "";
+
+  function patchPhoto(kidKey, id, patch) {
+    updateKidData(kidKey, (d) => ({
+      ...d,
+      photos: d.photos.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+    }));
+  }
+
+  async function approvePhoto(photo) {
+    const approvedBy = currentUser ? currentUser.name || currentUser.email : null;
+    patchPhoto(photo.kidKey, photo.id, { approved: true, approvedBy });
+    if (!syncUrl) return;
+    try {
+      setDriveNote("Saving to Drive…");
+      const name = `${THEMES[photo.kidKey].name}-${photo.id}.jpg`;
+      const res = await savePhotoToDrive(syncUrl, photo.url, name, photo.caption || "");
+      patchPhoto(photo.kidKey, photo.id, { driveFileId: res.fileId, driveUrl: res.url });
+      if ((photo.tags || []).includes("grad-slideshow")) {
+        await copyPhotoToSlideshowFolder(syncUrl, res.fileId);
+      }
+      setDriveNote("Saved to Drive ✓");
+      setTimeout(() => setDriveNote(""), 2500);
+    } catch (err) {
+      setDriveNote("Approved here, but the Drive save failed: " + err.message);
+      setTimeout(() => setDriveNote(""), 6000);
+    }
+  }
+
+  function rejectPhoto(photo) {
+    updateKidData(photo.kidKey, (d) => ({ ...d, photos: d.photos.filter((p) => p.id !== photo.id) }));
+  }
+
+  function togglePhotoTag(photo, tagId) {
+    const tags = photo.tags || [];
+    const next = tags.includes(tagId) ? tags.filter((t) => t !== tagId) : [...tags, tagId];
+    patchPhoto(photo.kidKey, photo.id, { tags: next });
+  }
   const approved = members.filter((m) => m.status === "approved");
   const denied = members.filter((m) => m.status === "denied");
 
@@ -4790,7 +5260,8 @@ function AdminPage({
 
       <div style={{ display: "flex", background: "#E7E4EE", borderRadius: 9, padding: 3 }}>
         {[
-          { id: "people", label: `People${pending.length ? ` (${pending.length})` : ""}` },
+          { id: "review", label: `Review${reviewCount ? ` (${reviewCount})` : ""}` },
+          { id: "people", label: "People" },
           { id: "reminders", label: "Reminders" },
           { id: "system", label: "System" },
         ].map((tabDef) => (
@@ -4802,7 +5273,7 @@ function AdminPage({
               border: "none",
               borderRadius: 7,
               padding: "8px 0",
-              fontSize: 12.5,
+              fontSize: 11.5,
               fontWeight: 800,
               cursor: "pointer",
               background: section === tabDef.id ? "#fff" : "transparent",
@@ -4815,10 +5286,32 @@ function AdminPage({
         ))}
       </div>
 
-      {section === "people" && (
+      {section === "review" && (
         <>
+          {driveNote && (
+            <div
+              style={{
+                background: "#F1EFF8",
+                border: "1px solid #D9D2EC",
+                borderRadius: 9,
+                padding: "9px 12px",
+                fontSize: 12.5,
+                fontWeight: 600,
+                color: "#4B2E83",
+              }}
+            >
+              {driveNote}
+            </div>
+          )}
+
+          {reviewCount === 0 && (
+            <SectionCard title="All clear">
+              <EmptyLine text="Nothing waiting for review right now." />
+            </SectionCard>
+          )}
+
           {pending.length > 0 && (
-            <SectionCard title={`⏳ Waiting for approval (${pending.length})`}>
+            <SectionCard title={`👥 People waiting (${pending.length})`}>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {pending.map((m) => (
                   <div
@@ -4924,6 +5417,98 @@ function AdminPage({
             </SectionCard>
           )}
 
+          {pendingPhotos.length > 0 && (
+            <SectionCard title={`📷 Photos waiting (${pendingPhotos.length})`}>
+              <div style={{ fontSize: 12, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
+                Only you see these. Approving publishes to the gallery and saves the file to your
+                Google Drive photos folder.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {pendingPhotos.map((p) => (
+                  <div key={p.id} style={{ borderRadius: 10, overflow: "hidden", border: "1px solid #E7E4EE" }}>
+                    <div style={{ position: "relative" }}>
+                      <PhotoImg src={p.url} style={{ width: "100%", height: 120, objectFit: "cover" }} />
+                      <div style={{ position: "absolute", top: 5, left: 5 }}>
+                        <KidDot kid={THEMES[p.kidKey]} />
+                      </div>
+                    </div>
+                    <div style={{ padding: 9 }}>
+                      {p.caption && (
+                        <div style={{ fontSize: 12, marginBottom: 5, color: "#565064" }}>{p.caption}</div>
+                      )}
+                      {p.submittedBy && (
+                        <div style={{ fontSize: 10.5, color: "#A19DAF", marginBottom: 6, fontStyle: "italic" }}>
+                          from {p.submittedBy}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 7 }}>
+                        {PHOTO_TAGS.map((tag) => {
+                          const active = (p.tags || []).includes(tag.id);
+                          return (
+                            <button
+                              key={tag.id}
+                              onClick={() => togglePhotoTag(p, tag.id)}
+                              style={{
+                                border: `1px solid ${active ? "#4B2E83" : "#E0DCE8"}`,
+                                background: active ? "#4B2E83" : "transparent",
+                                color: active ? "#fff" : "#8A8494",
+                                borderRadius: 12,
+                                padding: "2px 8px",
+                                fontSize: 10,
+                                fontWeight: 700,
+                                cursor: "pointer",
+                              }}
+                            >
+                              {tag.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          onClick={() => approvePhoto(p)}
+                          style={{
+                            flex: 1,
+                            background: "#2E7D32",
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: 6,
+                            padding: "7px 0",
+                            fontSize: 12,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          onClick={() => rejectPhoto(p)}
+                          style={{
+                            flex: 1,
+                            background: "transparent",
+                            color: "#8A8494",
+                            border: "1px solid #E0DCE8",
+                            borderRadius: 6,
+                            padding: "7px 0",
+                            fontSize: 12,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </SectionCard>
+          )}
+        </>
+      )}
+
+      {section === "people" && (
+        <>
           <SectionCard title={`Approved (${approved.length})`}>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {approved.length === 0 && <EmptyLine text="Nobody approved yet." />}
@@ -5144,3 +5729,4 @@ function AdminPage({
     </div>
   );
 }
+
