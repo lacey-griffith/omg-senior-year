@@ -1,17 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 
 /* ============================================================
-   APP CONFIG — fill these in once and every visitor gets sync +
-   Google Sign-In automatically, no per-device setup needed.
-   - syncUrl: your deployed Apps Script Web App URL (ends in /exec)
-   - googleClientId: your OAuth Client ID (ends in .apps.googleusercontent.com)
-   Leave either blank to keep that feature off by default — people can
-   still turn it on manually per-device via Settings, same as before.
+   APP CONFIG — set once; every visitor picks these up automatically.
+   - syncUrl:    deployed Apps Script Web App URL (ends in /exec)
+   - adminEmail: whoever signs in with this email gets admin
    ============================================================ */
 const APP_CONFIG = {
   syncUrl: "https://script.google.com/macros/s/AKfycbzO-UAvxVYtl2GoBtRhlutGkMIKdih8HeaqzyKTSwr8FclVgSkBtdqaKmwvMc8UX38i7Q/exec",
-  // Leave blank to use the family member request/approve flow.
-  googleClientId: "",
   // Whoever signs in with this email is the admin — approves/denies requests
   // and manages everyone else. Set here (not by who signs up first) so control
   // can't be claimed by whoever happens to open the link first.
@@ -273,10 +268,7 @@ function loadStore() {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (!parsed.settings) parsed.settings = { phoneNumbers: [] };
-      if (parsed.settings.accessCode === undefined) parsed.settings.accessCode = "";
-      if (parsed.settings.deviceUnlocked === undefined) parsed.settings.deviceUnlocked = false;
       if (parsed.settings.syncUrl === undefined) parsed.settings.syncUrl = APP_CONFIG.syncUrl;
-      if (parsed.settings.googleClientId === undefined) parsed.settings.googleClientId = APP_CONFIG.googleClientId;
       if (!parsed.settings.members) parsed.settings.members = [];
       ["tyler", "gracie"].forEach((k) => {
         if (parsed[k] && parsed[k].headerPreset === undefined) parsed[k].headerPreset = "solid";
@@ -295,10 +287,7 @@ function loadStore() {
   const initial = {
     settings: {
       phoneNumbers: [],
-      accessCode: "",
-      deviceUnlocked: false,
       syncUrl: APP_CONFIG.syncUrl,
-      googleClientId: APP_CONFIG.googleClientId,
       members: [],
     },
   };
@@ -356,91 +345,61 @@ function clearMemberId() {
 }
 
 
-function loadGoogleAuthSession() {
-  try {
-    const raw = sessionStorage.getItem(AUTH_SESSION_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed.exp || parsed.exp * 1000 < Date.now()) return null; // expired
-    return parsed;
-  } catch (e) {
-    return null;
-  }
-}
-
-function saveGoogleAuthSession(auth) {
-  try {
-    sessionStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(auth));
-  } catch (e) {}
-}
-
-function clearGoogleAuthSession() {
-  try {
-    sessionStorage.removeItem(AUTH_SESSION_KEY);
-  } catch (e) {}
-}
-
 /* ---------- shared sync (Google Drive via Apps Script Web App) ----------
    syncUrl points to a small Apps Script Web App that reads/writes a single
    JSON file in the family's Google Drive. See google-apps-script/Code.gs
    and the README for setup. This is whole-store, last-write-wins sync —
    fine for casual family use, not built for simultaneous multi-editor
-   conflict resolution.
-
-   If Google Sign-In is configured, every request carries the signed-in
-   user's Google ID token, and the Apps Script itself verifies it (and
-   checks the email against its allow-list) before returning or saving
-   anything — the gate isn't just cosmetic on the front end. */
-async function fetchRemoteStore(url, token) {
-  const sep = url.includes("?") ? "&" : "?";
-  const fetchUrl = token ? `${url}${sep}token=${encodeURIComponent(token)}` : url;
-  const res = await fetch(fetchUrl, { method: "GET", cache: "no-store" });
+   conflict resolution. */
+async function fetchRemoteStore(url) {
+  const res = await fetch(url, { method: "GET", cache: "no-store" });
   if (!res.ok) throw new Error("Sync fetch failed: " + res.status);
+  return res.json();
+}
+
+/* Uploads an approved photo into the family's Drive photos folder.
+   Returns the Drive file ID so a later "slideshow" tag can copy that same
+   file instead of re-uploading the bytes. */
+async function savePhotoToDrive(url, dataUrl, name, caption) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action: "savePhoto", dataUrl, name, caption }),
+  });
+  if (!res.ok) throw new Error("Photo upload failed: " + res.status);
   const data = await res.json();
-  if (data && data.ok === false) {
-    const err = new Error(data.error || "Unauthorized");
-    err.unauthorized = data.error === "Unauthorized";
-    throw err;
-  }
+  if (!data.ok) throw new Error(data.error || "Photo upload failed");
   return data;
 }
 
-async function pushRemoteStore(url, store, token) {
+async function copyPhotoToSlideshowFolder(url, fileId) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action: "copyToSlideshow", fileId }),
+  });
+  if (!res.ok) throw new Error("Slideshow copy failed: " + res.status);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Slideshow copy failed");
+  return data;
+}
+
+async function pushRemoteStore(url, store) {
   // text/plain avoids a CORS preflight against the Apps Script endpoint;
   // the script itself parses the body as JSON.
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ token: token || null, data: store }),
+    body: JSON.stringify({ data: store }),
   });
   if (!res.ok) throw new Error("Sync push failed: " + res.status);
   const data = await res.json();
-  if (data && data.ok === false) {
-    const err = new Error(data.error || "Unauthorized");
-    err.unauthorized = data.error === "Unauthorized";
-    throw err;
-  }
   return data;
 }
 
 /* Decodes (does NOT verify) a JWT payload — fine for reading display info
    like name/email/picture client-side. Verification of the signature and
    allow-list happens server-side in the Apps Script for every sync call. */
-function parseJwt(token) {
-  try {
-    const base64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-    const json = decodeURIComponent(
-      atob(base64)
-        .split("")
-        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-        .join("")
-    );
-    return JSON.parse(json);
-  } catch (e) {
-    return null;
-  }
-}
-
 /* ---------- utility ---------- */
 function daysUntil(iso) {
   const now = new Date();
@@ -538,91 +497,71 @@ function headerBackground(theme, preset) {
    ============================================================ */
 export default function SeniorYearHub() {
   const [store, setStore] = useState(loadStore);
-  const [activeKid, setActiveKid] = useState("overview");
   const [tab, setTab] = useState("home");
-  const [showReminders, setShowReminders] = useState(false);
-  const [familyView, setFamilyView] = useState(false);
+  const [kidFilter, setKidFilter] = useState("both"); // "both" | "tyler" | "gracie"
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | synced | error
   const [lastSynced, setLastSynced] = useState(null);
-  const [googleAuth, setGoogleAuth] = useState(loadGoogleAuthSession); // { token, email, name, picture, exp }
   const [memberId, setMemberId] = useState(loadMemberId);
   const hasLoadedRemoteRef = useRef(false);
   const pushTimeoutRef = useRef(null);
   const syncUrl = (store.settings && store.settings.syncUrl) || "";
-  const googleClientId = (store.settings && store.settings.googleClientId) || "";
-  const needsGoogleAuth = !!googleClientId && !!syncUrl && !googleAuth;
-  const authToken = googleClientId ? (googleAuth && googleAuth.token) : null;
 
   useEffect(() => {
     saveStore(store);
   }, [store]);
 
-  // Pull the shared copy whenever the sync URL/token changes.
+  // Pull the shared copy on load / whenever the sync URL changes.
   useEffect(() => {
-    if (!syncUrl || needsGoogleAuth) {
-      hasLoadedRemoteRef.current = !syncUrl;
-      if (!syncUrl) setSyncStatus("idle");
+    if (!syncUrl) {
+      hasLoadedRemoteRef.current = true;
+      setSyncStatus("idle");
       return;
     }
     let cancelled = false;
     hasLoadedRemoteRef.current = false;
     setSyncStatus("syncing");
-    fetchRemoteStore(syncUrl, authToken)
+    fetchRemoteStore(syncUrl)
       .then((remote) => {
         if (cancelled) return;
         if (remote && (remote.tyler || remote.gracie)) {
           setStore((prev) => ({
             ...remote,
-            settings: { ...(remote.settings || {}), syncUrl: prev.settings.syncUrl, googleClientId: prev.settings.googleClientId },
+            settings: { ...(remote.settings || {}), syncUrl: prev.settings.syncUrl },
           }));
         }
         hasLoadedRemoteRef.current = true;
         setSyncStatus("synced");
         setLastSynced(new Date());
       })
-      .catch((err) => {
+      .catch(() => {
         if (cancelled) return;
         hasLoadedRemoteRef.current = true;
         setSyncStatus("error");
-        // A stale/expired Google token — drop it so the sign-in gate reappears.
-        if (err.unauthorized && googleClientId) handleSignOut();
       });
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [syncUrl, authToken, needsGoogleAuth]);
+  }, [syncUrl]);
 
-  // Push local changes to the shared copy, debounced so rapid edits don't
-  // fire a request per keystroke.
+  // Push local changes back, debounced so rapid edits don't spam the endpoint.
   useEffect(() => {
-    if (!syncUrl || needsGoogleAuth || !hasLoadedRemoteRef.current) return;
+    if (!syncUrl || !hasLoadedRemoteRef.current) return;
     if (pushTimeoutRef.current) clearTimeout(pushTimeoutRef.current);
     pushTimeoutRef.current = setTimeout(() => {
       setSyncStatus("syncing");
-      pushRemoteStore(syncUrl, store, authToken)
+      pushRemoteStore(syncUrl, store)
         .then(() => {
           setSyncStatus("synced");
           setLastSynced(new Date());
         })
-        .catch((err) => {
-          setSyncStatus("error");
-          if (err.unauthorized && googleClientId) handleSignOut();
-        });
+        .catch(() => setSyncStatus("error"));
     }, 1500);
     return () => clearTimeout(pushTimeoutRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store, syncUrl, authToken, needsGoogleAuth]);
+  }, [store, syncUrl]);
 
-  const isOverview = activeKid === "overview";
-  const theme = isOverview ? null : THEMES[activeKid];
-  const data = isOverview ? null : store[activeKid];
-
-  function updateKid(updater) {
-    setStore((prev) => ({
-      ...prev,
-      [activeKid]: updater(prev[activeKid]),
-    }));
+  function updateKidData(kidKey, updater) {
+    setStore((prev) => ({ ...prev, [kidKey]: updater(prev[kidKey]) }));
   }
 
   function updateSettings(updater) {
@@ -632,11 +571,6 @@ export default function SeniorYearHub() {
     }));
   }
 
-  function jumpToKid(kidKey) {
-    setActiveKid(kidKey);
-    setTab("home");
-  }
-
   function updateProfilePic(kidKey, dataUrl) {
     setStore((prev) => ({
       ...prev,
@@ -644,53 +578,24 @@ export default function SeniorYearHub() {
     }));
   }
 
-  function handleAuthed(auth) {
-    saveGoogleAuthSession(auth);
-    setGoogleAuth(auth);
-  }
-
-  function handleSignOut() {
-    clearGoogleAuthSession();
-    setGoogleAuth(null);
-  }
-
-  const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "", members: [] };
+  const settings = store.settings || { phoneNumbers: [], syncUrl: "", members: [] };
   const members = settings.members || [];
-  const membersEnabled = !googleClientId; // member flow is the default when Google auth isn't set up
   const adminEmail = (APP_CONFIG.adminEmail || "").trim().toLowerCase();
   const me = memberId ? members.find((m) => m.id === memberId) : null;
-  // Admin is whoever matches the configured admin email — not whoever signed
-  // up first. That means control can't be claimed by a random early visitor,
-  // and it still works if the members list is ever wiped.
   const isAdmin = !!(me && adminEmail && me.email.trim().toLowerCase() === adminEmail);
   const pendingCount = members.filter((m) => m.status === "pending").length;
   const perms = permsFor(me, isAdmin);
 
-  function setMemberPermissions(id, nextPerms) {
-    updateSettings((s) => ({
-      ...s,
-      members: (s.members || []).map((m) =>
-        m.id === id ? { ...m, permissions: nextPerms } : m
-      ),
-    }));
-  }
-
-  // Called from the signup wizard's final step with the whole profile at once.
-  // Nothing touches the shared file until they submit, so half-finished
-  // signups from strangers never land in your data.
+  /* ---------- membership ---------- */
   function requestAccess(profile) {
     const cleanEmail = (profile.email || "").trim();
     const lower = cleanEmail.toLowerCase();
-
-    // Already known? Just re-attach this device to that record rather than
-    // creating a duplicate — handles new phones, cleared browsers, etc.
     const existing = members.find((m) => m.email.trim().toLowerCase() === lower);
     if (existing) {
       saveMemberId(existing.id);
       setMemberId(existing.id);
       return;
     }
-
     const id = "m" + Date.now() + Math.random().toString(36).slice(2, 7);
     const isTheAdmin = !!adminEmail && lower === adminEmail;
     const newMember = {
@@ -702,7 +607,6 @@ export default function SeniorYearHub() {
       kids: profile.kids || [],
       photo: profile.photo || null,
       note: (profile.note || "").trim(),
-      // The admin never waits on anyone; everyone else needs approval.
       status: isTheAdmin ? "approved" : "pending",
       role: isTheAdmin ? "admin" : "member",
       requestedAt: new Date().toISOString(),
@@ -712,8 +616,6 @@ export default function SeniorYearHub() {
     setMemberId(id);
   }
 
-  // Lets a returning member get back in from a new device without redoing
-  // the whole wizard — just match on email.
   function findMemberByEmail(email) {
     const lower = (email || "").trim().toLowerCase();
     if (!lower) return null;
@@ -730,9 +632,7 @@ export default function SeniorYearHub() {
     updateSettings((s) => ({
       ...s,
       members: (s.members || []).map((m) =>
-        m.id === id
-          ? { ...m, status: "approved", permissions: { ...preset.perms } }
-          : m
+        m.id === id ? { ...m, status: "approved", permissions: { ...preset.perms } } : m
       ),
     }));
   }
@@ -748,25 +648,20 @@ export default function SeniorYearHub() {
     updateSettings((s) => ({ ...s, members: (s.members || []).filter((m) => m.id !== id) }));
   }
 
+  function setMemberPermissions(id, nextPerms) {
+    updateSettings((s) => ({
+      ...s,
+      members: (s.members || []).map((m) => (m.id === id ? { ...m, permissions: nextPerms } : m)),
+    }));
+  }
+
   function switchMember() {
     clearMemberId();
     setMemberId(null);
   }
 
-  const needsPasscode = !googleClientId && !membersEnabled && !!settings.accessCode && !settings.deviceUnlocked;
-
-  if (needsGoogleAuth) {
-    return (
-      <GoogleSignInGate
-        clientId={googleClientId}
-        syncUrl={syncUrl}
-        onAuthed={handleAuthed}
-      />
-    );
-  }
-
-  // Member flow: introduce yourself, then wait for the admin to approve.
-  if (membersEnabled && !me) {
+  /* ---------- gates ---------- */
+  if (!me) {
     return (
       <SignupWizard
         onSubmit={requestAccess}
@@ -776,237 +671,118 @@ export default function SeniorYearHub() {
       />
     );
   }
-
-  if (membersEnabled && me && me.status === "pending") {
+  if (me.status === "pending") {
     return <PendingApprovalScreen member={me} onSwitch={switchMember} syncStatus={syncStatus} />;
   }
-
-  if (membersEnabled && me && me.status === "denied") {
+  if (me.status === "denied") {
     return <DeniedScreen member={me} onSwitch={switchMember} />;
   }
 
-  if (needsPasscode) {
-    return (
-      <AccessGate
-        accessCode={settings.accessCode}
-        onUnlock={() => updateSettings((s) => ({ ...s, deviceUnlocked: true }))}
-      />
-    );
-  }
+  const visibleKids =
+    kidFilter === "both" ? Object.keys(THEMES) : [kidFilter];
 
   return (
     <div
       style={{
         minHeight: "100vh",
-        background: isOverview ? "#F4F3F6" : theme.bg,
-        color: isOverview ? "#232028" : theme.text,
+        background: "#F4F3F6",
+        color: "#232028",
         fontFamily:
           "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
         display: "flex",
         flexDirection: "column",
-        transition: "background 0.25s ease",
       }}
     >
-      <KidSwitcher
-        activeKid={activeKid}
-        setActiveKid={setActiveKid}
-        onOpenReminders={() => setShowReminders(true)}
-        familyView={familyView}
-        setFamilyView={setFamilyView}
-        syncStatus={syncStatus}
-        googleAuth={googleAuth}
-        onSignOut={handleSignOut}
+      <AppHeader
         me={me}
         isAdmin={isAdmin}
-        pendingCount={pendingCount}
+        syncStatus={syncStatus}
+        kidFilter={kidFilter}
+        setKidFilter={setKidFilter}
+        showKidFilter={tab !== "admin"}
       />
 
-      {isOverview ? (
-        <ParentDashboard
-          store={store}
-          jumpToKid={jumpToKid}
-          updateProfilePic={updateProfilePic}
-          familyView={familyView || !isAdmin}
-          perms={perms}
-        />
-      ) : (
-        <>
-          <TopBar theme={theme} data={data} updateKid={updateKid} familyView={familyView} perms={perms} />
-          <div style={{ flex: 1, paddingBottom: 84, maxWidth: 640, margin: "0 auto", width: "100%" }}>
-            {tab === "home" && <HomeTab theme={theme} data={data} setTab={setTab} perms={perms} />}
-            {tab === "events" &&
-              (perms.viewEvents ? (
-                <EventsTab
-                  theme={theme}
-                  data={data}
-                  updateKid={updateKid}
-                  settings={store.settings || { phoneNumbers: [] }}
-                  onOpenReminders={() => setShowReminders(true)}
-                  familyView={familyView || !perms.addEvents}
-                  currentUser={me || googleAuth}
-                />
-              ) : (
-                <NoAccessPanel theme={theme} what="events" />
-              ))}
-            {tab === "gallery" &&
-              (perms.viewGallery ? (
-                <GalleryTab
-                  theme={theme}
-                  data={data}
-                  updateKid={updateKid}
-                  familyView={familyView || !perms.approvePhotos}
-                  currentUser={me || googleAuth}
-                />
-              ) : (
-                <NoAccessPanel theme={theme} what="the photo gallery" />
-              ))}
-            {tab === "party" &&
-              (perms.viewParty ? (
-                <PartyTab
-                  theme={theme}
-                  data={data}
-                  updateKid={updateKid}
-                  familyView={familyView || !perms.editParty}
-                  perms={perms}
-                />
-              ) : (
-                <NoAccessPanel theme={theme} what="the party planner" />
-              ))}
-            {tab === "submit" &&
-              (perms.submitPhotos ? (
-                <SubmitTab theme={theme} data={data} updateKid={updateKid} />
-              ) : (
-                <NoAccessPanel theme={theme} what="photo submissions" />
-              ))}
-          </div>
-          <BottomNav theme={theme} tab={tab} setTab={setTab} perms={perms} />
-        </>
-      )}
-
-      {showReminders && (
-        <RemindersSettingsModal
-          settings={store.settings || { phoneNumbers: [] }}
-          updateSettings={updateSettings}
-          onClose={() => setShowReminders(false)}
-          syncStatus={syncStatus}
-          lastSynced={lastSynced}
-          googleAuth={googleAuth}
-          onSignOut={handleSignOut}
-          me={me}
-          isAdmin={isAdmin}
-          members={members}
-          membersEnabled={membersEnabled}
-          onApproveMember={approveMember}
-          onDenyMember={denyMember}
-          onRemoveMember={removeMember}
-          onSetPermissions={setMemberPermissions}
-
-          onSwitchMember={switchMember}
-        />
-      )}
-    </div>
-  );
-}
-
-/* ============================================================
-   ACCESS GATE — lightweight shared passcode, not full auth.
-   Blocks casual/rando access to a shared link; not strong security.
-   ============================================================ */
-function AccessGate({ accessCode, onUnlock }) {
-  const [input, setInput] = useState("");
-  const [error, setError] = useState("");
-
-  function submit() {
-    if (input.trim().toLowerCase() === accessCode.trim().toLowerCase()) {
-      setError("");
-      onUnlock();
-    } else {
-      setError("That code doesn't match — check with whoever shared it with you.");
-    }
-  }
-
-  return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(135deg, #2B2B2B, #4B2E83)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 20,
-        boxSizing: "border-box",
-        fontFamily: "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
-      }}
-    >
-      <div
-        style={{
-          background: "#fff",
-          borderRadius: 16,
-          padding: 28,
-          width: "100%",
-          maxWidth: 360,
-          boxSizing: "border-box",
-          textAlign: "center",
-        }}
-      >
-        <div style={{ fontSize: 30, marginBottom: 6 }}>🔒</div>
-        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
-        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
-          This family hub is private. Enter the access code you were given to continue.
-        </div>
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && submit()}
-          placeholder="Access code"
-          autoFocus
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: `1.5px solid ${error ? "#E8B4B4" : "#E0DCE8"}`,
-            borderRadius: 9,
-            padding: "12px 14px",
-            fontSize: 15,
-            textAlign: "center",
-            marginBottom: 10,
-            fontFamily: "inherit",
-          }}
-        />
-        {error && (
-          <div style={{ fontSize: 12, color: "#B33A3A", fontWeight: 600, marginBottom: 10 }}>{error}</div>
+      <div style={{ flex: 1, paddingBottom: 84, maxWidth: 680, margin: "0 auto", width: "100%" }}>
+        {tab === "home" && (
+          <DashboardTab
+            store={store}
+            visibleKids={visibleKids}
+            perms={perms}
+            me={me}
+            isAdmin={isAdmin}
+            setTab={setTab}
+            updateProfilePic={updateProfilePic}
+            pendingCount={pendingCount}
+          />
         )}
-        <button
-          onClick={submit}
-          disabled={!input.trim()}
-          style={{
-            width: "100%",
-            background: input.trim() ? "#4B2E83" : "#E7E1F5",
-            color: input.trim() ? "#fff" : "#A8A2BC",
-            border: "none",
-            borderRadius: 9,
-            padding: "12px 0",
-            fontWeight: 800,
-            fontSize: 14.5,
-            cursor: input.trim() ? "pointer" : "not-allowed",
-          }}
-        >
-          Unlock
-        </button>
+        {tab === "events" &&
+          (perms.viewEvents ? (
+            <EventsTab
+              store={store}
+              visibleKids={visibleKids}
+              updateKidData={updateKidData}
+              settings={settings}
+              perms={perms}
+              currentUser={me}
+            />
+          ) : (
+            <NoAccessPanel what="events" />
+          ))}
+        {tab === "gallery" &&
+          (perms.viewGallery ? (
+            <GalleryTab
+              store={store}
+              visibleKids={visibleKids}
+              updateKidData={updateKidData}
+              perms={perms}
+              currentUser={me}
+              settings={settings}
+            />
+          ) : (
+            <NoAccessPanel what="the photo gallery" />
+          ))}
+        {tab === "party" &&
+          (perms.viewParty ? (
+            <PartyTab
+              store={store}
+              visibleKids={visibleKids}
+              updateKidData={updateKidData}
+              perms={perms}
+            />
+          ) : (
+            <NoAccessPanel what="the party planner" />
+          ))}
+        {tab === "submit" &&
+          (perms.submitPhotos ? (
+            <SubmitTab store={store} updateKidData={updateKidData} currentUser={me} />
+          ) : (
+            <NoAccessPanel what="photo submissions" />
+          ))}
+        {tab === "admin" &&
+          (isAdmin ? (
+            <AdminPage
+              settings={settings}
+              updateSettings={updateSettings}
+              members={members}
+              me={me}
+              syncStatus={syncStatus}
+              lastSynced={lastSynced}
+              onApproveMember={approveMember}
+              onDenyMember={denyMember}
+              onRemoveMember={removeMember}
+              onSetPermissions={setMemberPermissions}
+              onSwitchMember={switchMember}
+            />
+          ) : (
+            <NoAccessPanel what="admin settings" />
+          ))}
       </div>
+
+      <BottomNav tab={tab} setTab={setTab} perms={perms} isAdmin={isAdmin} pendingCount={pendingCount} />
     </div>
   );
 }
 
-/* ============================================================
-   GOOGLE SIGN-IN GATE — real, server-verified auth.
-   Renders Google's own Sign-In button (Google Identity Services, loaded
-   via the <script> tag in index.html), then hands the resulting ID token
-   to the Apps Script sync endpoint, which verifies it and checks the
-   caller's email against its own allow-list before returning anything.
-   A rejected/invalid token never gets past that server-side check, even
-   if someone bypassed this screen entirely.
-   ============================================================ */
 /* ============================================================
    MEMBER ACCESS FLOW — introduce yourself, admin approves.
    No passwords: this is an access-request queue, not authentication.
@@ -1601,486 +1377,121 @@ function DeniedScreen({ member, onSwitch }) {
     </div>
   );
 }
-
-function GoogleSignInGate({ clientId, syncUrl, onAuthed }) {
-  const buttonRef = useRef(null);
-  const [ready, setReady] = useState(false);
-  const [verifying, setVerifying] = useState(false);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    function tryInit() {
-      if (cancelled) return;
-      if (!window.google || !window.google.accounts || !window.google.accounts.id) {
-        setTimeout(tryInit, 200);
-        return;
-      }
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-        callback: handleCredential,
-        auto_select: true,
-      });
-      if (buttonRef.current) {
-        window.google.accounts.id.renderButton(buttonRef.current, {
-          theme: "outline",
-          size: "large",
-          width: 280,
-        });
-      }
-      setReady(true);
-    }
-    tryInit();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clientId]);
-
-  function handleCredential(response) {
-    const token = response.credential;
-    const info = parseJwt(token);
-    setVerifying(true);
-    setError("");
-    // The real check: ask the Apps Script to accept this token. If the
-    // caller's email isn't on its allow-list, this fails and we never let
-    // them in, regardless of what the front end thinks.
-    fetchRemoteStore(syncUrl, token)
-      .then(() => {
-        onAuthed({
-          token,
-          email: info && info.email,
-          name: info && info.name,
-          picture: info && info.picture,
-          exp: info && info.exp,
-        });
-      })
-      .catch((err) => {
-        setVerifying(false);
-        if (err.unauthorized) {
-          setError(
-            (info && info.email ? info.email : "That Google account") +
-              " isn't on the family list yet. Ask whoever manages this hub to add that exact " +
-              "email address, then click the sign-in button again — or click it again now to " +
-              "pick a different Google account."
-          );
-        } else {
-          setError("Couldn't reach the sync service to verify — check your connection and try again.");
-        }
-      });
-  }
-
-  return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(135deg, #2B2B2B, #4B2E83)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 20,
-        boxSizing: "border-box",
-        fontFamily: "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
-      }}
-    >
-      <div
-        style={{
-          background: "#fff",
-          borderRadius: 16,
-          padding: 28,
-          width: "100%",
-          maxWidth: 360,
-          boxSizing: "border-box",
-          textAlign: "center",
-        }}
-      >
-        <div style={{ fontSize: 30, marginBottom: 6 }}>🔒</div>
-        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
-        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
-          This family hub is private. Sign in with your own Google account —
-          nothing to set up, no new password. If your email's been added to
-          the family list, you're straight in.
-        </div>
-
-        <div style={{ display: "flex", justifyContent: "center", minHeight: 44, marginBottom: 14 }}>
-          <div ref={buttonRef} />
-          {!ready && (
-            <div style={{ fontSize: 12.5, color: "#A19DAF", alignSelf: "center" }}>Loading sign-in…</div>
-          )}
-        </div>
-
-        {verifying && (
-          <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 10 }}>Checking your account…</div>
-        )}
-        {error && (
-          <div style={{ fontSize: 12.5, color: "#B33A3A", fontWeight: 600, lineHeight: 1.5 }}>{error}</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 /* ============================================================
    KID SWITCHER — the signature element: a two-tab "ID badge" rail
    ============================================================ */
-const OVERVIEW_BAR = {
-  key: "overview",
-  name: "Overview",
-  primary: "#2B2B2B",
-  primaryDarker: "#1A1A1A",
-  onPrimary: "#FFFFFF",
-};
+/* ============================================================
+   APP HEADER — single bar across the whole app. Replaces the old
+   per-kid switcher; kids are now a filter, not separate pages.
+   ============================================================ */
+function AppHeader({ me, isAdmin, syncStatus, kidFilter, setKidFilter, showKidFilter }) {
+  const syncIcon =
+    syncStatus === "syncing" ? "🔄" : syncStatus === "synced" ? "🟢" : syncStatus === "error" ? "🔴" : "";
+  const syncTitle =
+    syncStatus === "syncing"
+      ? "Syncing…"
+      : syncStatus === "synced"
+      ? "Synced"
+      : syncStatus === "error"
+      ? "Sync problem — changes are saved on this device only"
+      : "";
 
-function KidSwitcher({ activeKid, setActiveKid, onOpenReminders, familyView, setFamilyView, syncStatus, googleAuth, onSignOut, me, isAdmin, pendingCount }) {
-  const options = [OVERVIEW_BAR, ...Object.values(THEMES)];
   return (
-    <>
+    <div style={{ position: "sticky", top: 0, zIndex: 20 }}>
       <div
         style={{
+          background: "#2B2B2B",
+          color: "#fff",
+          padding: "10px 16px",
           display: "flex",
-          width: "100%",
-          position: "sticky",
-          top: 0,
-          zIndex: 20,
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 10,
         }}
       >
-        {options.map((t) => {
-          const active = activeKid === t.key;
-          return (
-            <button
-              key={t.key}
-              onClick={() => setActiveKid(t.key)}
-              style={{
-                flex: 1,
-                border: "none",
-                cursor: "pointer",
-                padding: active ? "12px 8px 10px" : "9px 8px 7px",
-                background: active ? t.primary : t.primaryDarker,
-                color: t.onPrimary,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 7,
-                fontWeight: 800,
-                letterSpacing: 0.3,
-                fontSize: active ? 13.5 : 11.5,
-                opacity: active ? 1 : 0.72,
-                transition: "all 0.18s ease",
-                boxShadow: active ? "inset 0 -3px 0 rgba(0,0,0,0.15)" : "none",
-              }}
-            >
-              {t.logo ? (
-                <img
-                  src={t.logo}
-                  alt=""
-                  style={{ width: 20, height: 20, objectFit: "contain", borderRadius: 4 }}
-                />
-              ) : (
-                <span
-                  style={{
-                    width: 20,
-                    height: 20,
-                    borderRadius: 5,
-                    background: "rgba(255,255,255,0.22)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 11,
-                  }}
-                >
-                  👨‍👩‍👧‍👦
-                </span>
-              )}
-              {t.key === "overview" ? "BOTH KIDS" : `${t.name.toUpperCase()}`}
-            </button>
-          );
-        })}
-        <button
-          onClick={() => setFamilyView(!familyView)}
-          title="Family view (read-only, for sharing your screen)"
-          style={{
-            border: "none",
-            cursor: "pointer",
-            background: familyView ? "#5B4A00" : "#1A1A1A",
-            color: "#fff",
-            padding: "0 12px",
-            fontSize: 15,
-            flexShrink: 0,
-          }}
-        >
-          {familyView ? "👁️" : "👀"}
-        </button>
-        {syncStatus !== "idle" && (
-          <span
-            title={
-              syncStatus === "syncing"
-                ? "Syncing…"
-                : syncStatus === "synced"
-                ? "Synced with shared Drive copy"
-                : "Sync failed — check connection or the sync URL in settings"
-            }
-            style={{
-              display: "flex",
-              alignItems: "center",
-              padding: "0 8px",
-              background: "#1A1A1A",
-              fontSize: 12,
-            }}
-          >
-            {syncStatus === "syncing" ? "🔄" : syncStatus === "synced" ? "🟢" : "🔴"}
-          </span>
-        )}
-        {googleAuth && (
-          <button
-            onClick={() => {
-              if (window.confirm("Sign out of " + (googleAuth.email || "this account") + "?")) {
-                onSignOut();
-              }
-            }}
-            title={"Signed in as " + (googleAuth.email || "")}
-            style={{
-              border: "none",
-              cursor: "pointer",
-              background: "#1A1A1A",
-              padding: "0 8px",
-              display: "flex",
-              alignItems: "center",
-            }}
-          >
-            {googleAuth.picture ? (
-              <img
-                src={googleAuth.picture}
-                alt=""
-                style={{ width: 20, height: 20, borderRadius: "50%", display: "block" }}
-              />
-            ) : (
-              <span style={{ fontSize: 14 }}>👤</span>
-            )}
-          </button>
-        )}
-        {me && (
-          <span
-            title={"Signed in as " + me.name + (isAdmin ? " (admin)" : "")}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 4,
-              padding: "0 10px",
-              background: "#1A1A1A",
-              color: "#fff",
-              fontSize: 11,
-              fontWeight: 700,
-              whiteSpace: "nowrap",
-            }}
-          >
-            {isAdmin ? "★" : "👤"} {me.name.split(" ")[0]}
-          </span>
-        )}
-        <button
-          onClick={onOpenReminders}
-          title={isAdmin && pendingCount > 0 ? pendingCount + " access request(s) waiting" : "Settings"}
-          style={{
-            border: "none",
-            cursor: "pointer",
-            background: "#1A1A1A",
-            color: "#fff",
-            padding: "0 14px",
-            fontSize: 16,
-            flexShrink: 0,
-            position: "relative",
-          }}
-        >
-          ⚙️
-          {isAdmin && pendingCount > 0 && (
-            <span
-              style={{
-                position: "absolute",
-                top: 4,
-                right: 6,
-                background: "#E4611F",
-                color: "#fff",
-                borderRadius: "50%",
-                minWidth: 15,
-                height: 15,
-                fontSize: 9.5,
-                fontWeight: 800,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                padding: "0 3px",
-              }}
-            >
-              {pendingCount}
+        <div style={{ fontWeight: 800, fontSize: 14, letterSpacing: 0.3 }}>
+          🎓 Senior Year Hub
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {syncIcon && (
+            <span title={syncTitle} style={{ fontSize: 11 }}>
+              {syncIcon}
             </span>
           )}
-        </button>
+          <span
+            title={me.email}
+            style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700 }}
+          >
+            {me.photo ? (
+              <img
+                src={me.photo}
+                alt=""
+                style={{ width: 22, height: 22, borderRadius: "50%", objectFit: "cover" }}
+              />
+            ) : (
+              <span>{isAdmin ? "★" : "👤"}</span>
+            )}
+            {me.name.split(" ")[0]}
+          </span>
+        </div>
       </div>
-      {familyView && (
+
+      {showKidFilter && (
         <div
           style={{
-            background: "#FFF3C4",
-            color: "#5B4A00",
-            textAlign: "center",
-            fontSize: 12,
-            fontWeight: 700,
-            padding: "6px 10px",
+            background: "#fff",
+            borderBottom: "1px solid #E7E4EE",
+            padding: "8px 16px",
+            display: "flex",
+            gap: 8,
           }}
         >
-          👁️ Family view — browsing only, editing controls are hidden
+          <KidFilterChip
+            active={kidFilter === "both"}
+            onClick={() => setKidFilter("both")}
+            label="Both kids"
+            color="#4B2E83"
+          />
+          {Object.values(THEMES).map((t) => (
+            <KidFilterChip
+              key={t.key}
+              active={kidFilter === t.key}
+              onClick={() => setKidFilter(t.key)}
+              label={t.name}
+              color={t.primary}
+              logo={t.logo}
+            />
+          ))}
         </div>
       )}
-    </>
+    </div>
   );
 }
 
-function TopBar({ theme, data, updateKid, familyView }) {
-  const [activeCountdownId, setActiveCountdownId] = useState(data.activeCountdown || "graduation");
-  const [showAddCountdown, setShowAddCountdown] = useState(false);
-  const [showHeaderEditor, setShowHeaderEditor] = useState(false);
-  const preset = data.headerPreset || "solid";
-  const bg = data.headerBg
-    ? `url(${data.headerBg})`
-    : headerBackground(theme, preset);
-
-  const countdowns = data.countdowns && data.countdowns.length ? data.countdowns : defaultCountdowns(theme.key);
-  const active = countdowns.find((c) => c.id === activeCountdownId) || countdowns[0];
-  const d = daysUntil(active.date + "T00:00:00");
-
-  function selectCountdown(id) {
-    setActiveCountdownId(id);
-    updateKid((dd) => ({ ...dd, activeCountdown: id }));
-  }
-
-  function addCountdown(label, date) {
-    const id = "c" + Date.now();
-    updateKid((dd) => ({ ...dd, countdowns: [...(dd.countdowns || countdowns), { id, label, date }] }));
-    setActiveCountdownId(id);
-    updateKid((dd) => ({ ...dd, activeCountdown: id }));
-    setShowAddCountdown(false);
-  }
-
-  function removeCountdown(id) {
-    updateKid((dd) => ({ ...dd, countdowns: (dd.countdowns || countdowns).filter((c) => c.id !== id) }));
-    if (activeCountdownId === id) selectCountdown("graduation");
-  }
-
+function KidFilterChip({ active, onClick, label, color, logo }) {
   return (
-    <div
+    <button
+      onClick={onClick}
       style={{
-        position: "relative",
-        background: bg,
-        backgroundSize: "cover",
-        backgroundPosition: "center",
-        color: "#fff",
-        padding: "18px 20px 22px",
-        overflow: "hidden",
+        border: `1.5px solid ${active ? color : "#E0DCE8"}`,
+        background: active ? color : "transparent",
+        color: active ? "#fff" : "#565064",
+        borderRadius: 18,
+        padding: "6px 13px",
+        fontSize: 12.5,
+        fontWeight: 700,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        whiteSpace: "nowrap",
       }}
     >
-      {data.headerBg && (
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            background: "linear-gradient(180deg, rgba(0,0,0,0.45), rgba(0,0,0,0.6))",
-          }}
-        />
+      {logo && (
+        <img src={logo} alt="" style={{ width: 15, height: 15, objectFit: "contain" }} />
       )}
-      {!familyView && (
-        <button
-          onClick={() => setShowHeaderEditor(true)}
-          title="Customize header"
-          style={{
-            position: "absolute",
-            top: 14,
-            right: 16,
-            background: "rgba(255,255,255,0.22)",
-            border: "none",
-            color: "#fff",
-            borderRadius: 8,
-            width: 32,
-            height: 32,
-            fontSize: 14,
-            cursor: "pointer",
-            zIndex: 2,
-          }}
-        >
-          ✏️
-        </button>
-      )}
-      <div style={{ maxWidth: 640, margin: "0 auto", position: "relative", zIndex: 1 }}>
-        <div style={{ fontSize: 12, opacity: 0.9, fontWeight: 700, letterSpacing: 0.6 }}>
-          {theme.school.toUpperCase()} · CLASS OF 2027
-        </div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 4 }}>
-          <span style={{ fontSize: 40, fontWeight: 900, lineHeight: 1 }}>
-            {d > 0 ? d : 0}
-          </span>
-          <span style={{ fontSize: 15, fontWeight: 700 }}>
-            {d > 0 ? `days to ${active.label.toLowerCase()}` : `${active.label} day! 🎉`}
-          </span>
-        </div>
-        {active.id === "graduation" && !theme.graduationConfirmed && (
-          <div style={{ fontSize: 11.5, opacity: 0.9, marginTop: 4 }}>
-            ⚠ Ceremony date is estimated — RRISD hasn't posted the exact 2027 time yet.
-          </div>
-        )}
-
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 12 }}>
-          {countdowns.map((c) => (
-            <button
-              key={c.id}
-              onClick={() => selectCountdown(c.id)}
-              style={{
-                border: "none",
-                borderRadius: 16,
-                padding: "5px 11px",
-                fontSize: 11.5,
-                fontWeight: 700,
-                cursor: "pointer",
-                background: c.id === active.id ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.18)",
-                color: c.id === active.id ? theme.primaryDark : "#fff",
-              }}
-            >
-              {c.label}
-            </button>
-          ))}
-          {!familyView && (
-            <button
-              onClick={() => setShowAddCountdown(true)}
-              style={{
-                border: "1px dashed rgba(255,255,255,0.6)",
-                borderRadius: 16,
-                padding: "5px 11px",
-                fontSize: 11.5,
-                fontWeight: 700,
-                cursor: "pointer",
-                background: "transparent",
-                color: "#fff",
-              }}
-            >
-              + Add
-            </button>
-          )}
-        </div>
-      </div>
-
-      {showHeaderEditor && (
-        <HeaderEditorModal
-          theme={theme}
-          data={data}
-          updateKid={updateKid}
-          onClose={() => setShowHeaderEditor(false)}
-        />
-      )}
-
-      {showAddCountdown && (
-        <AddCountdownModal
-          theme={theme}
-          onClose={() => setShowAddCountdown(false)}
-          onAdd={addCountdown}
-        />
-      )}
-    </div>
+      {label}
+    </button>
   );
 }
 
@@ -2329,124 +1740,162 @@ function HeaderEditorModal({ theme, data, updateKid, onClose }) {
 
 /* ============================================================
    PARENT DASHBOARD — combined overview, jump-off point to each kid
+
+/* ============================================================
+   DASHBOARD — everything for the selected kid(s) on one page.
    ============================================================ */
-function ParentDashboard({ store, jumpToKid, updateProfilePic, familyView, perms }) {
-  const p = perms || {};
+function DashboardTab({ store, visibleKids, perms, me, isAdmin, setTab, updateProfilePic, pendingCount }) {
   const today = new Date().toISOString().slice(0, 10);
 
   const combinedUpcoming = useMemo(() => {
     const merged = [];
-    Object.values(THEMES).forEach((t) => {
-      store[t.key].events
+    visibleKids.forEach((k) => {
+      store[k].events
         .filter((e) => e.date >= today)
-        .forEach((e) => merged.push({ ...e, kid: t }));
+        .forEach((e) => merged.push({ ...e, kid: THEMES[k] }));
     });
     return merged.sort((a, b) => a.date.localeCompare(b.date)).slice(0, 6);
-  }, [store]);
+  }, [store, visibleKids]);
 
-  const combinedPending = Object.values(THEMES).reduce(
-    (sum, t) => sum + store[t.key].photos.filter((p) => !p.approved).length,
+  const pendingPhotos = visibleKids.reduce(
+    (sum, k) => sum + store[k].photos.filter((p) => !p.approved).length,
     0
   );
 
   return (
-    <div style={{ padding: 20, maxWidth: 640, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16 }}>
-      <div>
-        <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: 0.6, color: "#8A8494" }}>
-          BOTH SENIORS · CLASS OF 2027
-        </div>
-        <div style={{ fontSize: 15, color: "#565064", marginTop: 4 }}>
-          A quick look at both kids — tap a card to open their full hub.
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 12 }}>
-        {Object.values(THEMES).map((t) => (
-          <KidCard
-            key={t.key}
-            theme={t}
-            data={store[t.key]}
-            onOpen={() => jumpToKid(t.key)}
-            onProfilePic={(dataUrl) => updateProfilePic(t.key, dataUrl)}
-            familyView={familyView}
-          />
-        ))}
-      </div>
-
-      {p.viewEvents && (
-      <SectionCard theme={{ card: "#fff", border: "#E7E4EE", text: "#232028", subtext: "#8A8494", primary: "#4B2E83", onPrimary: "#fff" }} title="Coming up — both kids">
-        {combinedUpcoming.length === 0 && <EmptyLine text="Nothing on the calendar yet." />}
-        {combinedUpcoming.map((e, i) => (
-          <div
-            key={i}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "9px 0",
-              borderBottom: i < combinedUpcoming.length - 1 ? "1px solid #EEECF2" : "none",
-            }}
-          >
-            <span
-              style={{
-                width: 22,
-                height: 22,
-                borderRadius: "50%",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 10.5,
-                fontWeight: 800,
-                color: e.kid.onPrimary,
-                background: e.kid.primary,
-                flexShrink: 0,
-              }}
-            >
-              {e.kid.name.charAt(0).toUpperCase()}
-            </span>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600, fontSize: 13.5 }}>{e.title}</div>
-              {(e.time || e.location) && (
-                <div style={{ fontSize: 11.5, color: "#A19DAF", fontWeight: 600 }}>
-                  {e.time ? fmtTime(e.time) : "All day"}
-                  {e.location ? ` · ${e.location}` : ""}
-                </div>
-              )}
-            </div>
-            <span style={{ fontSize: 12.5, color: "#8A8494", fontWeight: 700, whiteSpace: "nowrap" }}>
-              {fmtDate(e.date)}
-            </span>
-          </div>
-        ))}
-      </SectionCard>
-      )}
-
-      {p.approvePhotos && combinedPending > 0 && (
-        <div
+    <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
+      {isAdmin && pendingCount > 0 && (
+        <button
+          onClick={() => setTab("admin")}
           style={{
             background: "#FFF4E5",
             border: "1px solid #F5D9A8",
             borderRadius: 12,
             padding: "12px 14px",
             fontSize: 13.5,
-            fontWeight: 600,
+            fontWeight: 700,
             color: "#7A5A1A",
+            cursor: "pointer",
+            textAlign: "left",
           }}
         >
-          📷 {combinedPending} photo{combinedPending > 1 ? "s" : ""} waiting for approval across both galleries.
-        </div>
+          👥 {pendingCount} {pendingCount === 1 ? "person is" : "people are"} waiting for access —
+          review →
+        </button>
       )}
 
-      <div style={{ fontSize: 12, color: "#A19DAF", textAlign: "center", marginTop: 4 }}>
-        Tap Tyler or Gracie above to see events, gallery, and the party planner for that kid.
+      {isAdmin && perms.approvePhotos && pendingPhotos > 0 && (
+        <button
+          onClick={() => setTab("gallery")}
+          style={{
+            background: "#FFF4E5",
+            border: "1px solid #F5D9A8",
+            borderRadius: 12,
+            padding: "12px 14px",
+            fontSize: 13.5,
+            fontWeight: 700,
+            color: "#7A5A1A",
+            cursor: "pointer",
+            textAlign: "left",
+          }}
+        >
+          📷 {pendingPhotos} photo{pendingPhotos === 1 ? "" : "s"} waiting for review →
+        </button>
+      )}
+
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        {visibleKids.map((k) => (
+          <DashKidCard
+            key={k}
+            theme={THEMES[k]}
+            data={store[k]}
+            perms={perms}
+            wide={visibleKids.length === 1}
+            onProfilePic={(dataUrl) => updateProfilePic(k, dataUrl)}
+            canEdit={isAdmin}
+          />
+        ))}
       </div>
+
+      {perms.viewEvents && (
+        <SectionCard title="Coming up">
+          {combinedUpcoming.length === 0 && <EmptyLine text="Nothing on the calendar yet." />}
+          {combinedUpcoming.map((e, i) => (
+            <div
+              key={i}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "9px 0",
+                borderBottom: i < combinedUpcoming.length - 1 ? "1px solid #EEECF2" : "none",
+              }}
+            >
+              <KidDot kid={e.kid} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, fontSize: 13.5 }}>{e.title}</div>
+                {(e.time || e.location) && (
+                  <div style={{ fontSize: 11.5, color: "#A19DAF", fontWeight: 600 }}>
+                    {e.time ? fmtTime(e.time) : "All day"}
+                    {e.location ? ` · ${e.location}` : ""}
+                  </div>
+                )}
+              </div>
+              <span style={{ fontSize: 12.5, color: "#8A8494", fontWeight: 700, whiteSpace: "nowrap" }}>
+                {fmtDate(e.date)}
+              </span>
+            </div>
+          ))}
+          <TapLink onClick={() => setTab("events")} label="See all events →" />
+        </SectionCard>
+      )}
+
+      {perms.viewParty && (
+        <SectionCard title="Grad party progress">
+          {visibleKids.map((k) => (
+            <div key={k} style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 700 }}>{THEMES[k].name}</span>
+              </div>
+              <PartySummary theme={THEMES[k]} data={store[k]} />
+            </div>
+          ))}
+          <TapLink onClick={() => setTab("party")} label="Open party planner →" />
+        </SectionCard>
+      )}
     </div>
   );
 }
 
-function KidCard({ theme, data, onOpen, onProfilePic, familyView }) {
+function KidDot({ kid }) {
+  return (
+    <span
+      style={{
+        width: 22,
+        height: 22,
+        borderRadius: "50%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 10.5,
+        fontWeight: 800,
+        color: kid.onPrimary,
+        background: kid.primary,
+        flexShrink: 0,
+      }}
+    >
+      {kid.name.charAt(0).toUpperCase()}
+    </span>
+  );
+}
+
+function DashKidCard({ theme, data, perms, wide, onProfilePic, canEdit }) {
   const fileRef = useRef(null);
-  const d = daysUntil(theme.graduation);
+  const [activeCountdownId, setActiveCountdownId] = useState(data.activeCountdown || "graduation");
+  const countdowns =
+    data.countdowns && data.countdowns.length ? data.countdowns : defaultCountdowns(theme.key);
+  const active = countdowns.find((c) => c.id === activeCountdownId) || countdowns[0];
+  const d = daysUntil(active.date + "T00:00:00");
   const milestoneDone = data.milestones.filter((m) => m.done).length;
 
   function handleFile(e) {
@@ -2459,31 +1908,22 @@ function KidCard({ theme, data, onOpen, onProfilePic, familyView }) {
 
   return (
     <div
-      onClick={onOpen}
-      role="button"
-      tabIndex={0}
       style={{
-        flex: 1,
-        textAlign: "left",
-        cursor: "pointer",
-        border: "none",
+        flex: wide ? "1 1 100%" : "1 1 45%",
+        minWidth: 0,
         borderRadius: 14,
         padding: 16,
-        background: theme.primary,
-        color: theme.onPrimary,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
+        background: data.headerBg
+          ? `linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.62)), url(${data.headerBg}) center/cover`
+          : headerBackground(theme, data.headerPreset || "solid"),
+        color: "#fff",
         position: "relative",
       }}
     >
-      {!familyView && (
+      {canEdit && (
         <>
           <button
-            onClick={(e) => {
-              e.stopPropagation();
-              fileRef.current && fileRef.current.click();
-            }}
+            onClick={() => fileRef.current && fileRef.current.click()}
             title="Set profile picture"
             style={{
               position: "absolute",
@@ -2497,7 +1937,6 @@ function KidCard({ theme, data, onOpen, onProfilePic, familyView }) {
               color: "#fff",
               fontSize: 12,
               cursor: "pointer",
-              zIndex: 2,
             }}
           >
             📷
@@ -2506,104 +1945,71 @@ function KidCard({ theme, data, onOpen, onProfilePic, familyView }) {
         </>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 8 }}>
         {data.profilePic ? (
           <img
             src={data.profilePic}
             alt=""
-            style={{ width: 32, height: 32, objectFit: "cover", borderRadius: "50%", border: "2px solid rgba(255,255,255,0.6)" }}
+            style={{
+              width: 34,
+              height: 34,
+              borderRadius: "50%",
+              objectFit: "cover",
+              border: "2px solid rgba(255,255,255,0.6)",
+            }}
           />
-        ) : theme.logo ? (
-          <img src={theme.logo} alt="" style={{ width: 28, height: 28, objectFit: "contain", borderRadius: 5 }} />
-        ) : null}
-        <div style={{ fontWeight: 800, fontSize: 15 }}>{theme.name}</div>
+        ) : (
+          theme.logo && (
+            <img src={theme.logo} alt="" style={{ width: 28, height: 28, objectFit: "contain" }} />
+          )
+        )}
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 800, fontSize: 15 }}>{theme.name}</div>
+          <div style={{ fontSize: 10.5, opacity: 0.85, fontWeight: 700 }}>{theme.school}</div>
+        </div>
       </div>
-      <div style={{ fontSize: 11, opacity: 0.85, fontWeight: 700 }}>{theme.school}</div>
-      <div style={{ fontSize: 26, fontWeight: 900, marginTop: 2 }}>
+
+      <div style={{ fontSize: 30, fontWeight: 900, lineHeight: 1 }}>
         {d > 0 ? d : 0}
-        <span style={{ fontSize: 11, fontWeight: 700, marginLeft: 5, opacity: 0.85 }}>
-          days to grad
+        <span style={{ fontSize: 11, fontWeight: 700, marginLeft: 6, opacity: 0.9 }}>
+          days to {active.label.toLowerCase()}
         </span>
       </div>
-      <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.85 }}>
-        {milestoneDone}/{data.milestones.length} milestones done
-      </div>
-    </div>
-  );
-}
 
-/* ============================================================
-   HOME TAB
-   ============================================================ */
-function HomeTab({ theme, data, setTab, perms }) {
-  const p = perms || {};
-  const upcoming = useMemo(() => {
-    const today = new Date().toISOString().slice(0, 10);
-    return data.events
-      .filter((e) => e.date >= today)
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .slice(0, 4);
-  }, [data.events]);
-
-  const milestoneDone = data.milestones.filter((m) => m.done).length;
-  const milestonePct = Math.round((milestoneDone / data.milestones.length) * 100);
-
-  const pendingPhotos = data.photos.filter((p2) => !p2.approved).length;
-  const approvedPhotos = data.photos.filter((p2) => p2.approved).length;
-
-  return (
-    <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-      {p.viewEvents && (
-        <SectionCard theme={theme} title="Coming up">
-          {upcoming.length === 0 && (
-            <EmptyLine text="No upcoming events yet — add one in the Events tab." />
-          )}
-          {upcoming.map((e, i) => (
-            <div
-              key={i}
+      {countdowns.length > 1 && (
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 10 }}>
+          {countdowns.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setActiveCountdownId(c.id)}
               style={{
-                display: "flex",
-                justifyContent: "space-between",
-                padding: "9px 0",
-                borderBottom: i < upcoming.length - 1 ? `1px solid ${theme.border}` : "none",
+                border: "none",
+                borderRadius: 14,
+                padding: "4px 9px",
+                fontSize: 10.5,
+                fontWeight: 700,
+                cursor: "pointer",
+                background: c.id === active.id ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.18)",
+                color: c.id === active.id ? theme.primaryDark : "#fff",
               }}
             >
-              <span style={{ fontWeight: 600, fontSize: 14 }}>{e.title}</span>
-              <span style={{ fontSize: 13, color: theme.subtext, fontWeight: 700, whiteSpace: "nowrap", marginLeft: 12 }}>
-                {fmtDate(e.date)}
-              </span>
-            </div>
+              {c.label}
+            </button>
           ))}
-          <TapLink theme={theme} onClick={() => setTab("events")} label="See all events →" />
-        </SectionCard>
+        </div>
       )}
 
-      {p.viewMilestones && (
-        <SectionCard theme={theme} title="Milestone progress">
-          <ProgressBar theme={theme} pct={milestonePct} />
-          <div style={{ fontSize: 13, color: theme.subtext, marginTop: 8, fontWeight: 600 }}>
-            {milestoneDone} of {data.milestones.length} complete
-          </div>
-        </SectionCard>
-      )}
-
-      <div style={{ display: "flex", gap: 12 }}>
-        {p.viewEvents && <StatBlock theme={theme} value={data.events.length} label="Events tracked" />}
-        {p.viewGallery && <StatBlock theme={theme} value={approvedPhotos} label="Photos in gallery" />}
-        {p.approvePhotos && <StatBlock theme={theme} value={pendingPhotos} label="Pending review" />}
-      </div>
-
-      {p.viewParty && (
-        <SectionCard theme={theme} title="Grad party checklist">
-          <PartySummary theme={theme} data={data} />
-          <TapLink theme={theme} onClick={() => setTab("party")} label="Open party planner →" />
-        </SectionCard>
+      {perms.viewMilestones && (
+        <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.9, marginTop: 10 }}>
+          {milestoneDone}/{data.milestones.length} milestones done
+        </div>
       )}
     </div>
   );
 }
 
 function PartySummary({ theme, data }) {
+  theme = theme || NEUTRAL;
   const allItems = PARTY_CATEGORIES.flatMap((c) => c.items.map((it) => `${c.id}:${it}`));
   const done = allItems.filter((key) => data.party[key]).length;
   const pct = Math.round((done / allItems.length) * 100);
@@ -2620,17 +2026,27 @@ function PartySummary({ theme, data }) {
 /* ============================================================
    EVENTS TAB
    ============================================================ */
-function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyView, currentUser }) {
+function EventsTab({ store, visibleKids, updateKidData, settings, perms, currentUser }) {
   const [filter, setFilter] = useState("All");
-  const [view, setView] = useState("list"); // "list" | "calendar"
-  const [showAdd, setShowAdd] = useState(false);
-  const [showQuickAdd, setShowQuickAdd] = useState(false);
+  const [view, setView] = useState("list");
+  const [addForKid, setAddForKid] = useState(null);   // kid key when the add modal is open
+  const [quickForKid, setQuickForKid] = useState(null);
   const [selectedDay, setSelectedDay] = useState(null);
   const categories = ["All", "School", "Holiday", "Milestone", "Personal"];
+  const canEdit = perms.addEvents;
+
+  // Merge both kids' events, tagging each with its kid so the UI can badge them.
+  const allEvents = useMemo(() => {
+    const merged = [];
+    visibleKids.forEach((k) => {
+      store[k].events.forEach((e) => merged.push({ ...e, kidKey: k }));
+    });
+    return merged;
+  }, [store, visibleKids]);
 
   const filteredEvents = useMemo(
-    () => (filter === "All" ? data.events : data.events.filter((e) => e.category === filter)),
-    [data.events, filter]
+    () => (filter === "All" ? allEvents : allEvents.filter((e) => e.category === filter)),
+    [allEvents, filter]
   );
 
   const grouped = useMemo(() => {
@@ -2644,33 +2060,37 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
     return groups;
   }, [filteredEvents]);
 
-  function addEvent(newEvent) {
+  function addEvent(kidKey, newEvent) {
     const addedBy = currentUser ? currentUser.name || currentUser.email : null;
-    updateKid((d) => ({ ...d, events: [...d.events, { ...newEvent, addedBy }] }));
-    setShowAdd(false);
+    updateKidData(kidKey, (d) => ({ ...d, events: [...d.events, { ...newEvent, addedBy }] }));
+    setAddForKid(null);
+    setQuickForKid(null);
   }
 
   function removeEvent(target) {
-    updateKid((d) => ({
+    updateKidData(target.kidKey, (d) => ({
       ...d,
       events: d.events.filter((e) => !(e.date === target.date && e.title === target.title)),
     }));
   }
 
+  // When only one kid is in view, adding is unambiguous; otherwise ask which kid.
+  const soleKid = visibleKids.length === 1 ? visibleKids[0] : null;
+
   return (
-    <div style={{ padding: 20 }}>
+    <div style={{ padding: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 8, flexWrap: "wrap" }}>
-        <ViewToggle theme={theme} view={view} setView={setView} />
-        {!familyView && (
+        <ViewToggle view={view} setView={setView} />
+        {canEdit && (
           <div style={{ display: "flex", gap: 8 }}>
             <button
-              onClick={() => setShowQuickAdd(true)}
+              onClick={() => setQuickForKid(soleKid || "__ask")}
               style={{
                 background: "transparent",
-                color: theme.primary,
-                border: `1.5px solid ${theme.primary}`,
+                color: "#4B2E83",
+                border: "1.5px solid #4B2E83",
                 borderRadius: 8,
-                padding: "8px 14px",
+                padding: "8px 13px",
                 fontSize: 13,
                 fontWeight: 800,
                 cursor: "pointer",
@@ -2680,13 +2100,13 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
               💬 Quick add
             </button>
             <button
-              onClick={() => setShowAdd(true)}
+              onClick={() => setAddForKid(soleKid || "__ask")}
               style={{
-                background: theme.primary,
-                color: theme.onPrimary,
+                background: "#4B2E83",
+                color: "#fff",
                 border: "none",
                 borderRadius: 8,
-                padding: "8px 14px",
+                padding: "8px 13px",
                 fontSize: 13,
                 fontWeight: 800,
                 cursor: "pointer",
@@ -2705,9 +2125,9 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
             key={c}
             onClick={() => setFilter(c)}
             style={{
-              border: `1.5px solid ${filter === c ? theme.primary : theme.border}`,
-              background: filter === c ? theme.primary : theme.card,
-              color: filter === c ? theme.onPrimary : theme.text,
+              border: `1.5px solid ${filter === c ? "#4B2E83" : "#E0DCE8"}`,
+              background: filter === c ? "#4B2E83" : "#fff",
+              color: filter === c ? "#fff" : "#232028",
               borderRadius: 20,
               padding: "6px 14px",
               fontSize: 13,
@@ -2730,61 +2150,52 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
                   fontSize: 12,
                   fontWeight: 800,
                   letterSpacing: 0.6,
-                  color: theme.subtext,
+                  color: "#8A8494",
                   marginBottom: 8,
                   textTransform: "uppercase",
                 }}
               >
                 {month}
               </div>
-              <SectionCard theme={theme} noPad>
+              <SectionCard noPad>
                 {events.map((e, i) => (
                   <div
                     key={i}
                     style={{
                       display: "flex",
                       alignItems: "flex-start",
-                      gap: 12,
+                      gap: 10,
                       padding: "12px 16px",
-                      borderBottom: i < events.length - 1 ? `1px solid ${theme.border}` : "none",
+                      borderBottom: i < events.length - 1 ? "1px solid #EEECF2" : "none",
                     }}
                   >
-                    <div
-                      style={{
-                        width: 8,
-                        height: 8,
-                        borderRadius: "50%",
-                        flexShrink: 0,
-                        marginTop: 5,
-                        background: CATEGORY_COLORS[e.category] || theme.primary,
-                      }}
-                    />
-                    <div style={{ flex: 1 }}>
+                    <KidDot kid={THEMES[e.kidKey]} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{e.title}</div>
-                      <div style={{ fontSize: 12.5, color: theme.subtext, fontWeight: 600, marginTop: 1 }}>
+                      <div style={{ fontSize: 12.5, color: "#8A8494", fontWeight: 600, marginTop: 1 }}>
                         {fmtDate(e.date)} · {e.time ? fmtTime(e.time) : "All day"} · {e.category}
                       </div>
                       {e.location && (
-                        <div style={{ fontSize: 12, color: theme.subtext, marginTop: 1 }}>📍 {e.location}</div>
+                        <div style={{ fontSize: 12, color: "#8A8494", marginTop: 1 }}>📍 {e.location}</div>
                       )}
                       {e.reminder && e.reminder.enabled && (
-                        <div style={{ fontSize: 11.5, color: theme.primary, fontWeight: 700, marginTop: 3 }}>
+                        <div style={{ fontSize: 11.5, color: "#4B2E83", fontWeight: 700, marginTop: 3 }}>
                           📱 Reminder set
                         </div>
                       )}
                       {e.addedBy && (
-                        <div style={{ fontSize: 11, color: theme.subtext, marginTop: 2, fontStyle: "italic" }}>
+                        <div style={{ fontSize: 11, color: "#A19DAF", marginTop: 2, fontStyle: "italic" }}>
                           Added by {e.addedBy}
                         </div>
                       )}
                     </div>
-                    {!familyView && e.custom && (
+                    {canEdit && e.custom && (
                       <button
                         onClick={() => removeEvent(e)}
                         style={{
                           background: "none",
                           border: "none",
-                          color: theme.subtext,
+                          color: "#8A8494",
                           fontSize: 13,
                           cursor: "pointer",
                         }}
@@ -2801,33 +2212,122 @@ function EventsTab({ theme, data, updateKid, settings, onOpenReminders, familyVi
         </>
       ) : (
         <CalendarView
-          theme={theme}
           events={filteredEvents}
           selectedDay={selectedDay}
           setSelectedDay={setSelectedDay}
           removeEvent={removeEvent}
-          familyView={familyView}
+          canEdit={canEdit}
         />
       )}
 
-      {showAdd && (
-        <AddEventModal
-          theme={theme}
-          onClose={() => setShowAdd(false)}
-          onAdd={addEvent}
-          settings={settings}
-          onOpenReminders={onOpenReminders}
-        />
+      {addForKid && (
+        addForKid === "__ask" ? (
+          <PickKidModal
+            title="Add an event for…"
+            onPick={(k) => setAddForKid(k)}
+            onClose={() => setAddForKid(null)}
+          />
+        ) : (
+          <AddEventModal
+            theme={THEMES[addForKid]}
+            onClose={() => setAddForKid(null)}
+            onAdd={(ev) => addEvent(addForKid, ev)}
+            settings={settings}
+          />
+        )
       )}
 
-      {showQuickAdd && (
-        <QuickAddModal theme={theme} onClose={() => setShowQuickAdd(false)} onAdd={addEvent} />
+      {quickForKid && (
+        quickForKid === "__ask" ? (
+          <PickKidModal
+            title="Quick add for…"
+            onPick={(k) => setQuickForKid(k)}
+            onClose={() => setQuickForKid(null)}
+          />
+        ) : (
+          <QuickAddModal
+            theme={THEMES[quickForKid]}
+            onClose={() => setQuickForKid(null)}
+            onAdd={(ev) => addEvent(quickForKid, ev)}
+          />
+        )
       )}
     </div>
   );
 }
 
+/* Small chooser used whenever an action needs to know which kid it applies to. */
+function PickKidModal({ title, onPick, onClose }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 94,
+        padding: 20,
+        boxSizing: "border-box",
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ background: "#fff", borderRadius: 16, padding: 20, width: "100%", maxWidth: 340 }}
+      >
+        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 14 }}>{title}</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {Object.values(THEMES).map((t) => (
+            <button
+              key={t.key}
+              onClick={() => onPick(t.key)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                background: t.primary,
+                color: "#fff",
+                border: "none",
+                borderRadius: 10,
+                padding: "12px 14px",
+                fontSize: 14,
+                fontWeight: 800,
+                cursor: "pointer",
+                textAlign: "left",
+              }}
+            >
+              {t.logo && <img src={t.logo} alt="" style={{ width: 22, height: 22, objectFit: "contain" }} />}
+              {t.name}
+              <span style={{ fontSize: 11, opacity: 0.85, fontWeight: 600 }}>· {t.school}</span>
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={onClose}
+          style={{
+            width: "100%",
+            marginTop: 12,
+            background: "transparent",
+            border: "1.5px solid #E0DCE8",
+            borderRadius: 9,
+            padding: "10px 0",
+            fontWeight: 700,
+            fontSize: 13.5,
+            cursor: "pointer",
+            color: "#565064",
+          }}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ViewToggle({ theme, view, setView }) {
+  theme = theme || NEUTRAL;
   return (
     <div style={{ display: "flex", background: theme.border, borderRadius: 9, padding: 3 }}>
       {["list", "calendar"].map((v) => (
@@ -2855,7 +2355,9 @@ function ViewToggle({ theme, view, setView }) {
 }
 
 /* ---------- Calendar month-grid view ---------- */
-function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent, familyView }) {
+function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent, canEdit }) {
+  theme = theme || NEUTRAL;
+  const familyView = !canEdit;
   const [cursor, setCursor] = useState(() => {
     const today = new Date();
     return new Date(today.getFullYear(), today.getMonth(), 1);
@@ -2947,7 +2449,7 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
                         width: 4,
                         height: 4,
                         borderRadius: "50%",
-                        background: isSelected ? theme.onPrimary : (CATEGORY_COLORS[e.category] || theme.primary),
+                        background: isSelected ? theme.onPrimary : (e.kidKey ? THEMES[e.kidKey].primary : (CATEGORY_COLORS[e.category] || theme.primary)),
                       }}
                     />
                   ))}
@@ -2977,15 +2479,19 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
                     borderBottom: i < eventsByDay[selectedDay].length - 1 ? `1px solid ${theme.border}` : "none",
                   }}
                 >
-                  <div
-                    style={{
-                      width: 8,
-                      height: 8,
-                      borderRadius: "50%",
-                      background: CATEGORY_COLORS[e.category] || theme.primary,
-                      flexShrink: 0,
-                    }}
-                  />
+                  {e.kidKey ? (
+                    <KidDot kid={THEMES[e.kidKey]} />
+                  ) : (
+                    <div
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background: CATEGORY_COLORS[e.category] || theme.primary,
+                        flexShrink: 0,
+                      }}
+                    />
+                  )}
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 700, fontSize: 14 }}>{e.title}</div>
                     <div style={{ fontSize: 12, color: theme.subtext, fontWeight: 600 }}>
@@ -3014,6 +2520,7 @@ function CalendarView({ theme, events, selectedDay, setSelectedDay, removeEvent,
 }
 
 function navBtnStyle(theme) {
+  theme = theme || NEUTRAL;
   return {
     width: 32,
     height: 32,
@@ -3555,57 +3062,116 @@ function inputStyle(theme) {
 /* ============================================================
    GALLERY TAB
    ============================================================ */
-function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
+function GalleryTab({ store, visibleKids, updateKidData, perms, currentUser, settings }) {
   const [slideshow, setSlideshow] = useState(false);
-  const [slideshowPhotos, setSlideshowPhotos] = useState(null); // null = use approved(filtered)
+  const [slideshowPhotos, setSlideshowPhotos] = useState(null);
   const [slideIdx, setSlideIdx] = useState(0);
-  const [showMemoryBook, setShowMemoryBook] = useState(false);
-  const [printPhotos, setPrintPhotos] = useState(null);
+  const [memoryBookPhotos, setMemoryBookPhotos] = useState(null);
   const [filterTag, setFilterTag] = useState("All");
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [detailPhoto, setDetailPhoto] = useState(null);
   const [openDetailConfirming, setOpenDetailConfirming] = useState(false);
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+  const [driveNote, setDriveNote] = useState("");
 
-  const approvedAll = data.photos.filter((p) => p.approved);
-  const pending = data.photos.filter((p) => !p.approved);
+  const syncUrl = (settings && settings.syncUrl) || "";
+  const canModerate = perms.approvePhotos;
+
+  // Flatten both kids' photos, tagging each with its owner.
+  const allPhotos = useMemo(() => {
+    const merged = [];
+    visibleKids.forEach((k) => {
+      store[k].photos.forEach((p) => merged.push({ ...p, kidKey: k }));
+    });
+    return merged;
+  }, [store, visibleKids]);
+
+  const approvedAll = allPhotos.filter((p) => p.approved);
+  const pending = allPhotos.filter((p) => !p.approved);
   const approved =
     filterTag === "All" ? approvedAll : approvedAll.filter((p) => (p.tags || []).includes(filterTag));
   const activeSlideshowSet = slideshowPhotos || approved;
   const selectedPhotos = approvedAll.filter((p) => selectedIds.includes(p.id));
 
-  function approve(id) {
+  function patchPhoto(kidKey, id, patch) {
+    updateKidData(kidKey, (d) => ({
+      ...d,
+      photos: d.photos.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+    }));
+  }
+
+  /* Approving does two things: flips the flag locally, and (if sync is set up)
+     pushes the image into the family's Drive photos folder. The Drive file ID
+     comes back so a later "slideshow" tag can copy that same file. */
+  async function approve(photo) {
     const approvedBy = currentUser ? currentUser.name || currentUser.email : null;
-    updateKid((d) => ({
-      ...d,
-      photos: d.photos.map((p) => (p.id === id ? { ...p, approved: true, approvedBy } : p)),
-    }));
+    patchPhoto(photo.kidKey, photo.id, { approved: true, approvedBy });
+
+    if (!syncUrl) return;
+    try {
+      setDriveNote("Saving to Drive…");
+      const name = `${THEMES[photo.kidKey].name}-${photo.id}.jpg`;
+      const res = await savePhotoToDrive(syncUrl, photo.url, name, photo.caption || "");
+      patchPhoto(photo.kidKey, photo.id, { driveFileId: res.fileId, driveUrl: res.url });
+
+      // Already tagged for the slideshow at submit time? Copy it straight over.
+      if ((photo.tags || []).includes("grad-slideshow")) {
+        await copyPhotoToSlideshowFolder(syncUrl, res.fileId);
+      }
+      setDriveNote("Saved to Drive ✓");
+      setTimeout(() => setDriveNote(""), 2500);
+    } catch (err) {
+      setDriveNote("Approved here, but couldn't save to Drive: " + err.message);
+      setTimeout(() => setDriveNote(""), 6000);
+    }
   }
-  function reject(id) {
-    updateKid((d) => ({ ...d, photos: d.photos.filter((p) => p.id !== id) }));
+
+  function reject(photo) {
+    updateKidData(photo.kidKey, (d) => ({ ...d, photos: d.photos.filter((p) => p.id !== photo.id) }));
   }
-  function toggleTagOnPhoto(id, tagId) {
-    updateKid((d) => ({
-      ...d,
-      photos: d.photos.map((p) => {
-        if (p.id !== id) return p;
-        const tags = p.tags || [];
-        return { ...p, tags: tags.includes(tagId) ? tags.filter((t) => t !== tagId) : [...tags, tagId] };
-      }),
-    }));
+
+  /* Tagging a photo "Grad Slideshow" copies it into the slideshow folder.
+     Untagging leaves the copy in place — removing files from Drive from here
+     felt too destructive to do silently. */
+  async function toggleTagOnPhoto(photo, tagId) {
+    const tags = photo.tags || [];
+    const nextTags = tags.includes(tagId) ? tags.filter((t) => t !== tagId) : [...tags, tagId];
+    patchPhoto(photo.kidKey, photo.id, { tags: nextTags });
+
+    const adding = !tags.includes(tagId);
+    if (adding && tagId === "grad-slideshow" && syncUrl && photo.driveFileId) {
+      try {
+        setDriveNote("Copying to slideshow folder…");
+        await copyPhotoToSlideshowFolder(syncUrl, photo.driveFileId);
+        setDriveNote("Copied to slideshow folder ✓");
+        setTimeout(() => setDriveNote(""), 2500);
+      } catch (err) {
+        setDriveNote("Tagged, but the slideshow copy failed: " + err.message);
+        setTimeout(() => setDriveNote(""), 6000);
+      }
+    }
   }
-  function deletePhoto(id) {
-    updateKid((d) => ({ ...d, photos: d.photos.filter((p) => p.id !== id) }));
-    setSelectedIds((prev) => prev.filter((i) => i !== id));
+
+  function deletePhoto(photo) {
+    updateKidData(photo.kidKey, (d) => ({ ...d, photos: d.photos.filter((p) => p.id !== photo.id) }));
+    setSelectedIds((prev) => prev.filter((i) => i !== photo.id));
     setDetailPhoto(null);
+    setOpenDetailConfirming(false);
   }
-  function deleteMultiple(ids) {
-    updateKid((d) => ({ ...d, photos: d.photos.filter((p) => !ids.includes(p.id)) }));
+
+  function deleteMultiple(photos) {
+    const byKid = {};
+    photos.forEach((p) => {
+      byKid[p.kidKey] = byKid[p.kidKey] || [];
+      byKid[p.kidKey].push(p.id);
+    });
+    Object.entries(byKid).forEach(([kidKey, ids]) => {
+      updateKidData(kidKey, (d) => ({ ...d, photos: d.photos.filter((p) => !ids.includes(p.id)) }));
+    });
     setSelectedIds([]);
     setBulkDeleteConfirm(false);
   }
-
-  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
 
   function toggleSelect(id) {
     setSelectedIds((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
@@ -3617,7 +3183,7 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
       const ext = match ? match[1] : "jpg";
       const a = document.createElement("a");
       a.href = p.url;
-      a.download = `${theme.name}-photo-${i + 1}.${ext}`;
+      a.download = `${THEMES[p.kidKey].name}-photo-${i + 1}.${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -3649,7 +3215,6 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
       >
         <PhotoImg
           src={photo.url}
-          alt=""
           style={{ maxWidth: "92%", maxHeight: "78%", borderRadius: 10, objectFit: "contain" }}
         />
         {photo.caption && (
@@ -3684,20 +3249,12 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
     );
   }
 
-  if (showMemoryBook) {
-    return (
-      <MemoryBookView theme={theme} data={data} photos={approvedAll} onClose={() => setShowMemoryBook(false)} />
-    );
-  }
-
-  if (printPhotos) {
+  if (memoryBookPhotos) {
     return (
       <MemoryBookView
-        theme={theme}
-        data={data}
-        photos={printPhotos}
-        subtitle="Selected Photos"
-        onClose={() => setPrintPhotos(null)}
+        photos={memoryBookPhotos.photos}
+        subtitle={memoryBookPhotos.subtitle}
+        onClose={() => setMemoryBookPhotos(null)}
       />
     );
   }
@@ -3705,16 +3262,38 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
   const filterOptions = [{ id: "All", label: "All" }, ...PHOTO_TAGS];
 
   return (
-    <div style={{ padding: 20 }}>
-      {!familyView && pending.length > 0 && (
-        <SectionCard theme={theme} title={`Pending approval (${pending.length})`}>
+    <div style={{ padding: 18 }}>
+      {driveNote && (
+        <div
+          style={{
+            background: "#F1EFF8",
+            border: "1px solid #D9D2EC",
+            borderRadius: 9,
+            padding: "9px 12px",
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: "#4B2E83",
+            marginBottom: 12,
+          }}
+        >
+          {driveNote}
+        </div>
+      )}
+
+      {canModerate && pending.length > 0 && (
+        <SectionCard title={`Pending approval (${pending.length})`}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             {pending.map((p) => (
-              <div key={p.id} style={{ borderRadius: 10, overflow: "hidden", border: `1px solid ${theme.border}` }}>
-                <PhotoImg src={p.url} alt="" style={{ width: "100%", height: 110, objectFit: "cover" }} />
+              <div key={p.id} style={{ borderRadius: 10, overflow: "hidden", border: "1px solid #E7E4EE" }}>
+                <div style={{ position: "relative" }}>
+                  <PhotoImg src={p.url} style={{ width: "100%", height: 110, objectFit: "cover" }} />
+                  <div style={{ position: "absolute", top: 5, left: 5 }}>
+                    <KidDot kid={THEMES[p.kidKey]} />
+                  </div>
+                </div>
                 <div style={{ padding: 8 }}>
                   {p.caption && (
-                    <div style={{ fontSize: 12, marginBottom: 6, color: theme.subtext }}>{p.caption}</div>
+                    <div style={{ fontSize: 12, marginBottom: 6, color: "#8A8494" }}>{p.caption}</div>
                   )}
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }}>
                     {PHOTO_TAGS.map((tag) => {
@@ -3722,11 +3301,11 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                       return (
                         <button
                           key={tag.id}
-                          onClick={() => toggleTagOnPhoto(p.id, tag.id)}
+                          onClick={() => toggleTagOnPhoto(p, tag.id)}
                           style={{
-                            border: `1px solid ${active ? theme.primary : theme.border}`,
-                            background: active ? theme.primary : "transparent",
-                            color: active ? theme.onPrimary : theme.subtext,
+                            border: `1px solid ${active ? "#4B2E83" : "#E0DCE8"}`,
+                            background: active ? "#4B2E83" : "transparent",
+                            color: active ? "#fff" : "#8A8494",
                             borderRadius: 12,
                             padding: "2px 8px",
                             fontSize: 10.5,
@@ -3741,11 +3320,11 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                   </div>
                   <div style={{ display: "flex", gap: 6 }}>
                     <button
-                      onClick={() => approve(p.id)}
+                      onClick={() => approve(p)}
                       style={{
                         flex: 1,
-                        background: theme.primary,
-                        color: theme.onPrimary,
+                        background: "#2E7D32",
+                        color: "#fff",
                         border: "none",
                         borderRadius: 6,
                         padding: "6px 0",
@@ -3757,12 +3336,12 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                       Approve
                     </button>
                     <button
-                      onClick={() => reject(p.id)}
+                      onClick={() => reject(p)}
                       style={{
                         flex: 1,
                         background: "transparent",
-                        color: theme.subtext,
-                        border: `1px solid ${theme.border}`,
+                        color: "#8A8494",
+                        border: "1px solid #E0DCE8",
                         borderRadius: 6,
                         padding: "6px 0",
                         fontSize: 12,
@@ -3780,15 +3359,15 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
         </SectionCard>
       )}
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, marginTop: 14, flexWrap: "wrap" }}>
         {filterOptions.map((f) => (
           <button
             key={f.id}
             onClick={() => setFilterTag(f.id)}
             style={{
-              border: `1.5px solid ${filterTag === f.id ? theme.primary : theme.border}`,
-              background: filterTag === f.id ? theme.primary : theme.card,
-              color: filterTag === f.id ? theme.onPrimary : theme.text,
+              border: `1.5px solid ${filterTag === f.id ? "#4B2E83" : "#E0DCE8"}`,
+              background: filterTag === f.id ? "#4B2E83" : "#fff",
+              color: filterTag === f.id ? "#fff" : "#232028",
               borderRadius: 20,
               padding: "6px 14px",
               fontSize: 13,
@@ -3802,21 +3381,20 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
       </div>
 
       <SectionCard
-        theme={theme}
         title={`Gallery (${approved.length})`}
         right={
           approved.length > 0 && (
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-              {!familyView && (
+              {canModerate && (
                 <button
                   onClick={() => {
                     setSelectionMode(!selectionMode);
                     setSelectedIds([]);
                   }}
                   style={{
-                    background: selectionMode ? theme.primary : "transparent",
-                    color: selectionMode ? theme.onPrimary : theme.primary,
-                    border: `1.5px solid ${theme.primary}`,
+                    background: selectionMode ? "#4B2E83" : "transparent",
+                    color: selectionMode ? "#fff" : "#4B2E83",
+                    border: "1.5px solid #4B2E83",
                     borderRadius: 7,
                     padding: "6px 12px",
                     fontSize: 12.5,
@@ -3828,11 +3406,11 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                 </button>
               )}
               <button
-                onClick={() => setShowMemoryBook(true)}
+                onClick={() => setMemoryBookPhotos({ photos: approvedAll, subtitle: "Memory Book" })}
                 style={{
                   background: "transparent",
-                  color: theme.primary,
-                  border: `1.5px solid ${theme.primary}`,
+                  color: "#4B2E83",
+                  border: "1.5px solid #4B2E83",
                   borderRadius: 7,
                   padding: "6px 12px",
                   fontSize: 12.5,
@@ -3849,8 +3427,8 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                   setSlideshow(true);
                 }}
                 style={{
-                  background: theme.primary,
-                  color: theme.onPrimary,
+                  background: "#4B2E83",
+                  color: "#fff",
                   border: "none",
                   borderRadius: 7,
                   padding: "6px 12px",
@@ -3866,26 +3444,19 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
         }
       >
         {selectionMode && (
-          <div
-            style={{
-              background: theme.accentSoft,
-              borderRadius: 9,
-              padding: "8px 12px",
-              marginBottom: 10,
-            }}
-          >
+          <div style={{ background: "#EFECF7", borderRadius: 9, padding: "8px 12px", marginBottom: 10 }}>
             {bulkDeleteConfirm ? (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
                 <span style={{ fontSize: 12.5, fontWeight: 700, color: "#8A2E2E" }}>
                   Delete {selectedIds.length} photo{selectedIds.length > 1 ? "s" : ""}? This can't be undone.
                 </span>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={() => setBulkDeleteConfirm(false)} style={miniBtnStyle(theme, false)}>
+                  <button onClick={() => setBulkDeleteConfirm(false)} style={miniBtnStyle(NEUTRAL, false)}>
                     Cancel
                   </button>
                   <button
-                    onClick={() => deleteMultiple(selectedIds)}
-                    style={{ ...miniBtnStyle(theme, true), background: "#B33A3A", borderColor: "#B33A3A" }}
+                    onClick={() => deleteMultiple(selectedPhotos)}
+                    style={{ ...miniBtnStyle(NEUTRAL, true), background: "#B33A3A", borderColor: "#B33A3A" }}
                   >
                     Yes, delete
                   </button>
@@ -3893,20 +3464,15 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
               </div>
             ) : (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                <span style={{ fontSize: 12.5, fontWeight: 700 }}>
-                  {selectedIds.length} selected
-                </span>
+                <span style={{ fontSize: 12.5, fontWeight: 700 }}>{selectedIds.length} selected</span>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <button
-                    onClick={() => setSelectedIds(approved.map((p) => p.id))}
-                    style={miniBtnStyle(theme, false)}
-                  >
+                  <button onClick={() => setSelectedIds(approved.map((p) => p.id))} style={miniBtnStyle(NEUTRAL, false)}>
                     Select all
                   </button>
                   <button
                     onClick={() => downloadPhotos(selectedPhotos)}
                     disabled={selectedIds.length === 0}
-                    style={miniBtnStyle(theme, true, selectedIds.length === 0)}
+                    style={miniBtnStyle(NEUTRAL, true, selectedIds.length === 0)}
                   >
                     ⬇ Download
                   </button>
@@ -3917,14 +3483,14 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                       setSlideshow(true);
                     }}
                     disabled={selectedIds.length === 0}
-                    style={miniBtnStyle(theme, true, selectedIds.length === 0)}
+                    style={miniBtnStyle(NEUTRAL, true, selectedIds.length === 0)}
                   >
                     ▶ Slideshow
                   </button>
                   <button
-                    onClick={() => setPrintPhotos(selectedPhotos)}
+                    onClick={() => setMemoryBookPhotos({ photos: selectedPhotos, subtitle: "Selected Photos" })}
                     disabled={selectedIds.length === 0}
-                    style={miniBtnStyle(theme, true, selectedIds.length === 0)}
+                    style={miniBtnStyle(NEUTRAL, true, selectedIds.length === 0)}
                   >
                     🖨️ Print
                   </button>
@@ -3965,44 +3531,18 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                 >
                   <PhotoImg
                     src={p.url}
-                    alt=""
                     style={{
                       width: "100%",
                       height: 90,
                       objectFit: "cover",
                       borderRadius: 8,
                       opacity: selectionMode && !selected ? 0.55 : 1,
-                      border: selected ? `2px solid ${theme.primary}` : "2px solid transparent",
+                      border: selected ? "2px solid #4B2E83" : "2px solid transparent",
                     }}
                   />
-                  {!selectionMode && !familyView && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDetailPhoto(p);
-                        setOpenDetailConfirming(true);
-                      }}
-                      title="Delete photo"
-                      style={{
-                        position: "absolute",
-                        top: 4,
-                        right: 4,
-                        width: 20,
-                        height: 20,
-                        borderRadius: "50%",
-                        border: "none",
-                        background: "rgba(0,0,0,0.55)",
-                        color: "#fff",
-                        fontSize: 10,
-                        cursor: "pointer",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                      }}
-                    >
-                      🗑️
-                    </button>
-                  )}
+                  <div style={{ position: "absolute", top: 4, left: 4, transform: "scale(0.8)", transformOrigin: "top left" }}>
+                    <KidDot kid={THEMES[p.kidKey]} />
+                  </div>
                   {selectionMode && (
                     <div
                       style={{
@@ -4012,8 +3552,8 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                         width: 18,
                         height: 18,
                         borderRadius: "50%",
-                        background: selected ? theme.primary : "rgba(255,255,255,0.85)",
-                        border: `1.5px solid ${selected ? theme.primary : "#ccc"}`,
+                        background: selected ? "#4B2E83" : "rgba(255,255,255,0.85)",
+                        border: `1.5px solid ${selected ? "#4B2E83" : "#ccc"}`,
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
@@ -4025,20 +3565,12 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
                       {selected ? "✓" : ""}
                     </div>
                   )}
-                  {!selectionMode && (p.tags || []).length > 0 && (
-                    <div style={{ position: "absolute", bottom: 3, left: 3, display: "flex", gap: 2 }}>
-                      {(p.tags || []).map((tId) => (
-                        <span
-                          key={tId}
-                          style={{
-                            width: 6,
-                            height: 6,
-                            borderRadius: "50%",
-                            background: theme.primary,
-                            border: "1px solid #fff",
-                          }}
-                        />
-                      ))}
+                  {!selectionMode && p.driveFileId && (
+                    <div
+                      title="Saved to Google Drive"
+                      style={{ position: "absolute", bottom: 3, right: 4, fontSize: 9 }}
+                    >
+                      ☁️
                     </div>
                   )}
                 </div>
@@ -4050,15 +3582,14 @@ function GalleryTab({ theme, data, updateKid, familyView, currentUser }) {
 
       {detailPhoto && (
         <PhotoDetailModal
-          theme={theme}
           photo={detailPhoto}
           onClose={() => {
             setDetailPhoto(null);
             setOpenDetailConfirming(false);
           }}
-          onToggleTag={(tagId) => toggleTagOnPhoto(detailPhoto.id, tagId)}
-          onDelete={() => deletePhoto(detailPhoto.id)}
-          familyView={familyView}
+          onToggleTag={(tagId) => toggleTagOnPhoto(detailPhoto, tagId)}
+          onDelete={() => deletePhoto(detailPhoto)}
+          canEdit={canModerate}
           startConfirm={openDetailConfirming}
           currentTags={
             (approvedAll.find((p) => p.id === detailPhoto.id) || detailPhoto).tags || []
@@ -4083,7 +3614,10 @@ function miniBtnStyle(theme, filled, disabled) {
   };
 }
 
-function PhotoDetailModal({ theme, photo, onClose, onToggleTag, onDelete, familyView, currentTags, startConfirm }) {
+function PhotoDetailModal({ photo, onClose, onToggleTag, onDelete, canEdit, currentTags, startConfirm }) {
+  const theme = NEUTRAL;
+  const coverKids = Object.keys(THEMES).filter((k) => photos.some((p) => p.kidKey === k));
+  const familyView = !canEdit;
   const [confirmingDelete, setConfirmingDelete] = useState(!!startConfirm);
 
   return (
@@ -4244,7 +3778,10 @@ function PhotoDetailModal({ theme, photo, onClose, onToggleTag, onDelete, family
 }
 
 /* ---------- Memory Book — printable keepsake page ---------- */
-function MemoryBookView({ theme, data, photos, onClose, subtitle }) {
+function MemoryBookView({ photos, onClose, subtitle }) {
+  // Spanning both kids now, so the cover uses shared branding rather than
+  // one school's colors.
+  const theme = NEUTRAL;
   return (
     <div style={{ background: "#fff", minHeight: "100vh" }}>
       <style>{`
@@ -4305,12 +3842,19 @@ function MemoryBookView({ theme, data, photos, onClose, subtitle }) {
       </div>
 
       <div className="mb-page" style={{ padding: "48px 32px", textAlign: "center", borderBottom: "1px solid #eee" }}>
-        {theme.logo && <img src={theme.logo} alt="" style={{ width: 90, margin: "0 auto 18px", objectFit: "contain" }} />}
-        <div style={{ fontSize: 13, letterSpacing: 2, color: "#8A8494", fontWeight: 700, textTransform: "uppercase" }}>
-          {theme.school}
+        <div style={{ display: "flex", justifyContent: "center", gap: 18, marginBottom: 18 }}>
+          {coverKids.map((k) =>
+            THEMES[k].logo ? (
+              <img key={k} src={THEMES[k].logo} alt="" style={{ width: 74, objectFit: "contain" }} />
+            ) : null
+          )}
         </div>
-        <div style={{ fontSize: 34, fontWeight: 900, color: theme.primary, marginTop: 8 }}>
-          {theme.name}'s Senior Year
+        <div style={{ fontSize: 13, letterSpacing: 2, color: "#8A8494", fontWeight: 700, textTransform: "uppercase" }}>
+          {coverKids.map((k) => THEMES[k].school).join(" · ")}
+        </div>
+        <div style={{ fontSize: 34, fontWeight: 900, color: "#4B2E83", marginTop: 8 }}>
+          {coverKids.map((k) => THEMES[k].name).join(" & ")}
+          {coverKids.length === 1 ? "'s" : "'s"} Senior Year
         </div>
         <div style={{ fontSize: 14, color: "#8A8494", marginTop: 6 }}>
           Class of 2027 — {subtitle || "Memory Book"}
@@ -4353,19 +3897,15 @@ function MemoryBookView({ theme, data, photos, onClose, subtitle }) {
 /* ============================================================
    PARTY PLANNER TAB
    ============================================================ */
-function PartyTab({ theme, data, updateKid, familyView, perms }) {
-  const canSeeBudget = !perms || perms.viewBudget;
-  const [view, setView] = useState("checklist"); // "checklist" | "budget"
-
-  function toggle(key) {
-    if (familyView) return;
-    updateKid((d) => ({ ...d, party: { ...d.party, [key]: !d.party[key] } }));
-  }
+function PartyTab({ store, visibleKids, updateKidData, perms }) {
+  const [view, setView] = useState("checklist");
+  const canSeeBudget = perms.viewBudget;
+  const canEdit = perms.editParty;
 
   return (
-    <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
       {canSeeBudget && (
-        <div style={{ display: "flex", background: theme.border, borderRadius: 9, padding: 3 }}>
+        <div style={{ display: "flex", background: "#E7E4EE", borderRadius: 9, padding: 3 }}>
           {["checklist", "budget"].map((v) => (
             <button
               key={v}
@@ -4378,8 +3918,8 @@ function PartyTab({ theme, data, updateKid, familyView, perms }) {
                 fontSize: 13,
                 fontWeight: 800,
                 cursor: "pointer",
-                background: view === v ? theme.card : "transparent",
-                color: view === v ? theme.text : theme.subtext,
+                background: view === v ? "#fff" : "transparent",
+                color: view === v ? "#232028" : "#8A8494",
                 boxShadow: view === v ? "0 1px 2px rgba(0,0,0,0.08)" : "none",
                 textTransform: "capitalize",
               }}
@@ -4390,63 +3930,101 @@ function PartyTab({ theme, data, updateKid, familyView, perms }) {
         </div>
       )}
 
-      {view === "checklist" || !canSeeBudget ? (
-        <>
-          {PARTY_CATEGORIES.map((cat) => {
-            const doneCount = cat.items.filter((it) => data.party[`${cat.id}:${it}`]).length;
-            return (
-              <SectionCard
-                key={cat.id}
-                theme={theme}
-                title={cat.label}
-                right={
-                  <span style={{ fontSize: 12, fontWeight: 700, color: theme.subtext }}>
-                    {doneCount}/{cat.items.length}
-                  </span>
-                }
-              >
-                {cat.items.map((item, i) => {
-                  const key = `${cat.id}:${item}`;
-                  const checked = !!data.party[key];
+      {visibleKids.map((kidKey) => {
+        const theme = THEMES[kidKey];
+        const data = store[kidKey];
+        return (
+          <div key={kidKey}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: 10,
+                paddingBottom: 8,
+                borderBottom: `2px solid ${theme.primary}`,
+              }}
+            >
+              {theme.logo && (
+                <img src={theme.logo} alt="" style={{ width: 22, height: 22, objectFit: "contain" }} />
+              )}
+              <span style={{ fontWeight: 800, fontSize: 15, color: theme.primary }}>
+                {theme.name}'s party
+              </span>
+            </div>
+
+            {view === "checklist" || !canSeeBudget ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {PARTY_CATEGORIES.map((cat) => {
+                  const doneCount = cat.items.filter((it) => data.party[`${cat.id}:${it}`]).length;
                   return (
-                    <label
-                      key={key}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: "8px 0",
-                        cursor: familyView ? "default" : "pointer",
-                        borderBottom: i < cat.items.length - 1 ? `1px solid ${theme.border}` : "none",
-                      }}
+                    <SectionCard
+                      key={cat.id}
+                      theme={theme}
+                      title={cat.label}
+                      right={
+                        <span style={{ fontSize: 12, fontWeight: 700, color: theme.subtext }}>
+                          {doneCount}/{cat.items.length}
+                        </span>
+                      }
                     >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        disabled={familyView}
-                        onChange={() => toggle(key)}
-                        style={{ width: 18, height: 18, accentColor: theme.primary }}
-                      />
-                      <span
-                        style={{
-                          fontSize: 14,
-                          fontWeight: 600,
-                          textDecoration: checked ? "line-through" : "none",
-                          color: checked ? theme.subtext : theme.text,
-                        }}
-                      >
-                        {item}
-                      </span>
-                    </label>
+                      {cat.items.map((item, i) => {
+                        const key = `${cat.id}:${item}`;
+                        const checked = !!data.party[key];
+                        return (
+                          <label
+                            key={key}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 10,
+                              padding: "8px 0",
+                              cursor: canEdit ? "pointer" : "default",
+                              borderBottom: i < cat.items.length - 1 ? `1px solid ${theme.border}` : "none",
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={!canEdit}
+                              onChange={() =>
+                                updateKidData(kidKey, (d) => ({
+                                  ...d,
+                                  party: { ...d.party, [key]: !d.party[key] },
+                                }))
+                              }
+                              style={{ width: 18, height: 18, accentColor: theme.primary }}
+                            />
+                            <span
+                              style={{
+                                fontSize: 14,
+                                fontWeight: 600,
+                                textDecoration: checked ? "line-through" : "none",
+                                color: checked ? theme.subtext : theme.text,
+                              }}
+                            >
+                              {item}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </SectionCard>
                   );
                 })}
-              </SectionCard>
-            );
-          })}
-        </>
-      ) : (
-        <BudgetView theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
-      )}
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <BudgetView
+                  theme={theme}
+                  data={data}
+                  updateKid={(updater) => updateKidData(kidKey, updater)}
+                  familyView={!canEdit}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -4540,13 +4118,16 @@ function BudgetView({ theme, data, updateKid, familyView }) {
 /* ============================================================
    SUBMIT PHOTO TAB
    ============================================================ */
-function SubmitTab({ theme, data, updateKid }) {
+function SubmitTab({ store, updateKidData, currentUser }) {
+  const [forKid, setForKid] = useState(null);
   const [caption, setCaption] = useState("");
   const [preview, setPreview] = useState(null);
   const [submitted, setSubmitted] = useState(false);
   const [tags, setTags] = useState([]);
   const [fileError, setFileError] = useState("");
   const fileRef = useRef(null);
+
+  const theme = forKid ? THEMES[forKid] : NEUTRAL;
 
   function handleFile(e) {
     const file = e.target.files[0];
@@ -4562,12 +4143,20 @@ function SubmitTab({ theme, data, updateKid }) {
   }
 
   function submit() {
-    if (!preview) return;
-    updateKid((d) => ({
+    if (!preview || !forKid) return;
+    const submittedBy = currentUser ? currentUser.name || currentUser.email : null;
+    updateKidData(forKid, (d) => ({
       ...d,
       photos: [
         ...d.photos,
-        { id: Date.now().toString(), url: preview, caption, approved: false, tags },
+        {
+          id: Date.now().toString(),
+          url: preview,
+          caption,
+          approved: false,
+          tags,
+          submittedBy,
+        },
       ],
     }));
     setPreview(null);
@@ -4579,17 +4168,42 @@ function SubmitTab({ theme, data, updateKid }) {
   }
 
   return (
-    <div style={{ padding: 20 }}>
-      <SectionCard theme={theme} title={`Share a photo — ${theme.name}'s senior year`}>
-        <div style={{ fontSize: 13.5, color: theme.subtext, marginBottom: 14, lineHeight: 1.5 }}>
-          Friends and family — thank you for contributing! Photos go through a quick review before
-          they appear in the gallery and party slideshow.
+    <div style={{ padding: 18 }}>
+      <SectionCard theme={theme} title="Share a photo">
+        <div style={{ fontSize: 13.5, color: "#8A8494", marginBottom: 14, lineHeight: 1.5 }}>
+          Thanks for contributing! Photos go through a quick review before they show up in the
+          gallery.
+        </div>
+
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 8 }}>
+          Who's this photo of?
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          {Object.values(THEMES).map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setForKid(t.key)}
+              style={{
+                flex: 1,
+                border: `1.5px solid ${forKid === t.key ? t.primary : "#E0DCE8"}`,
+                background: forKid === t.key ? t.primary : "transparent",
+                color: forKid === t.key ? "#fff" : "#565064",
+                borderRadius: 9,
+                padding: "10px 0",
+                fontSize: 13,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+            >
+              {t.name}
+            </button>
+          ))}
         </div>
 
         <div
           onClick={() => fileRef.current && fileRef.current.click()}
           style={{
-            border: `2px dashed ${theme.border}`,
+            border: "2px dashed #D9D5E3",
             borderRadius: 12,
             padding: preview ? 0 : 32,
             textAlign: "center",
@@ -4620,7 +4234,7 @@ function SubmitTab({ theme, data, updateKid }) {
           style={{
             width: "100%",
             boxSizing: "border-box",
-            border: `1.5px solid ${theme.border}`,
+            border: "1.5px solid #E0DCE8",
             borderRadius: 8,
             padding: "10px 12px",
             fontSize: 14,
@@ -4629,7 +4243,7 @@ function SubmitTab({ theme, data, updateKid }) {
           }}
         />
 
-        <div style={{ fontSize: 12, fontWeight: 700, color: theme.subtext, marginBottom: 8 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 8 }}>
           Tag this photo (optional)
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18 }}>
@@ -4640,9 +4254,9 @@ function SubmitTab({ theme, data, updateKid }) {
                 key={tag.id}
                 onClick={() => toggleTag(tag.id)}
                 style={{
-                  border: `1.5px solid ${active ? theme.primary : theme.border}`,
-                  background: active ? theme.primary : "transparent",
-                  color: active ? theme.onPrimary : theme.text,
+                  border: `1.5px solid ${active ? "#4B2E83" : "#E0DCE8"}`,
+                  background: active ? "#4B2E83" : "transparent",
+                  color: active ? "#fff" : "#232028",
                   borderRadius: 20,
                   padding: "6px 14px",
                   fontSize: 12.5,
@@ -4658,20 +4272,20 @@ function SubmitTab({ theme, data, updateKid }) {
 
         <button
           onClick={submit}
-          disabled={!preview}
+          disabled={!preview || !forKid}
           style={{
             width: "100%",
-            background: preview ? theme.primary : theme.border,
-            color: preview ? theme.onPrimary : theme.subtext,
+            background: preview && forKid ? "#4B2E83" : "#E7E1F5",
+            color: preview && forKid ? "#fff" : "#A8A2BC",
             border: "none",
             borderRadius: 9,
             padding: "12px 0",
             fontWeight: 800,
             fontSize: 14.5,
-            cursor: preview ? "pointer" : "not-allowed",
+            cursor: preview && forKid ? "pointer" : "not-allowed",
           }}
         >
-          {submitted ? "Submitted! Thank you 🎉" : "Submit photo"}
+          {submitted ? "Submitted! Thank you 🎉" : !forKid ? "Pick who it's of first" : "Submit photo"}
         </button>
       </SectionCard>
     </div>
@@ -4681,7 +4295,18 @@ function SubmitTab({ theme, data, updateKid }) {
 /* ============================================================
    SHARED UI BITS
    ============================================================ */
+const NEUTRAL = {
+  card: "#fff",
+  border: "#E7E4EE",
+  text: "#232028",
+  subtext: "#8A8494",
+  primary: "#4B2E83",
+  onPrimary: "#fff",
+  accentSoft: "#EFECF7",
+};
+
 function SectionCard({ theme, title, children, right, noPad }) {
+  theme = theme || NEUTRAL;
   return (
     <div
       style={{
@@ -4712,6 +4337,7 @@ function SectionCard({ theme, title, children, right, noPad }) {
 }
 
 function ProgressBar({ theme, pct }) {
+  theme = theme || NEUTRAL;
   return (
     <div style={{ background: theme.border, borderRadius: 20, height: 10, overflow: "hidden" }}>
       <div
@@ -4728,6 +4354,7 @@ function ProgressBar({ theme, pct }) {
 }
 
 function StatBlock({ theme, value, label }) {
+  theme = theme || NEUTRAL;
   return (
     <div
       style={{
@@ -4746,6 +4373,7 @@ function StatBlock({ theme, value, label }) {
 }
 
 function TapLink({ theme, onClick, label }) {
+  theme = theme || NEUTRAL;
   return (
     <button
       onClick={onClick}
@@ -4974,6 +4602,7 @@ function MemberRow({ member, onRemove, onSetPermissions }) {
 }
 
 function NoAccessPanel({ theme, what }) {
+  theme = theme || NEUTRAL;
   return (
     <div style={{ padding: 40, textAlign: "center" }}>
       <div style={{ fontSize: 28, marginBottom: 10 }}>🔒</div>
@@ -5018,7 +4647,7 @@ function PhotoImg({ src, alt, style }) {
   return <img src={src} alt={alt || ""} style={style} onError={() => setBroken(true)} />;
 }
 
-function BottomNav({ theme, tab, setTab, perms }) {
+function BottomNav({ tab, setTab, perms, isAdmin, pendingCount }) {
   const p = perms || {};
   const items = [
     { id: "home", label: "Home", icon: "🏠" },
@@ -5026,7 +4655,12 @@ function BottomNav({ theme, tab, setTab, perms }) {
     { id: "gallery", label: "Gallery", icon: "🖼️", need: "viewGallery" },
     { id: "party", label: "Party", icon: "🎉", need: "viewParty" },
     { id: "submit", label: "Submit", icon: "📤", need: "submitPhotos" },
-  ].filter((it) => !it.need || p[it.need]);
+    { id: "admin", label: "Admin", icon: "⚙️", adminOnly: true },
+  ].filter((it) => {
+    if (it.adminOnly) return isAdmin;
+    return !it.need || p[it.need];
+  });
+
   return (
     <div
       style={{
@@ -5044,6 +4678,7 @@ function BottomNav({ theme, tab, setTab, perms }) {
     >
       {items.map((it) => {
         const active = tab === it.id;
+        const badge = it.id === "admin" && pendingCount > 0 ? pendingCount : null;
         return (
           <button
             key={it.id}
@@ -5056,14 +4691,37 @@ function BottomNav({ theme, tab, setTab, perms }) {
               alignItems: "center",
               gap: 2,
               cursor: "pointer",
-              color: active ? theme.primary : "#9A9A9A",
+              color: active ? "#4B2E83" : "#9A9A9A",
               fontWeight: active ? 800 : 600,
               fontSize: 10.5,
               padding: "4px 10px",
+              position: "relative",
             }}
           >
             <span style={{ fontSize: 18 }}>{it.icon}</span>
             {it.label}
+            {badge && (
+              <span
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  right: 4,
+                  background: "#E4611F",
+                  color: "#fff",
+                  borderRadius: "50%",
+                  minWidth: 15,
+                  height: 15,
+                  fontSize: 9.5,
+                  fontWeight: 800,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: "0 3px",
+                }}
+              >
+                {badge}
+              </span>
+            )}
           </button>
         );
       })}
@@ -5075,796 +4733,414 @@ function BottomNav({ theme, tab, setTab, perms }) {
    REMINDERS SETTINGS — manage phone numbers used for text reminders
    Shared across both kids since it's the same parents.
    ============================================================ */
-function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onSetPermissions, onSwitchMember }) {
+/* ============================================================
+   ADMIN PAGE — a real page, not a modal. Approvals, permissions,
+   reminder numbers, and sync status all live here.
+   ============================================================ */
+function AdminPage({
+  settings,
+  updateSettings,
+  members,
+  me,
+  syncStatus,
+  lastSynced,
+  onApproveMember,
+  onDenyMember,
+  onRemoveMember,
+  onSetPermissions,
+  onSwitchMember,
+}) {
+  const [section, setSection] = useState("people");
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
-  const [codeInput, setCodeInput] = useState(settings.accessCode || "");
-  const [syncInput, setSyncInput] = useState(settings.syncUrl || "");
-  const [clientIdInput, setClientIdInput] = useState(settings.googleClientId || "");
   const phoneNumbers = settings.phoneNumbers || [];
+
+  const pending = members.filter((m) => m.status === "pending");
+  const approved = members.filter((m) => m.status === "approved");
+  const denied = members.filter((m) => m.status === "denied");
 
   function addNumber() {
     if (!label.trim() || !number.trim()) return;
     updateSettings((s) => ({
       ...s,
-      phoneNumbers: [...(s.phoneNumbers || []), { id: Date.now().toString(), label: label.trim(), number: number.trim() }],
+      phoneNumbers: [
+        ...(s.phoneNumbers || []),
+        { id: Date.now().toString(), label: label.trim(), number: number.trim() },
+      ],
     }));
     setLabel("");
     setNumber("");
   }
 
   function removeNumber(id) {
-    updateSettings((s) => ({ ...s, phoneNumbers: (s.phoneNumbers || []).filter((p) => p.id !== id) }));
-  }
-
-  function saveCode() {
-    updateSettings((s) => ({ ...s, accessCode: codeInput.trim(), deviceUnlocked: true }));
-  }
-
-  function removeCode() {
-    setCodeInput("");
-    updateSettings((s) => ({ ...s, accessCode: "", deviceUnlocked: false }));
-  }
-
-  function lockNow() {
-    updateSettings((s) => ({ ...s, deviceUnlocked: false }));
-    onClose();
-  }
-
-  function saveSyncUrl() {
-    updateSettings((s) => ({ ...s, syncUrl: syncInput.trim() }));
-  }
-
-  function clearSyncUrl() {
-    setSyncInput("");
-    updateSettings((s) => ({ ...s, syncUrl: "" }));
-  }
-
-  function saveClientId() {
-    updateSettings((s) => ({ ...s, googleClientId: clientIdInput.trim() }));
-  }
-
-  function clearClientId() {
-    setClientIdInput("");
-    updateSettings((s) => ({ ...s, googleClientId: "" }));
+    updateSettings((s) => ({
+      ...s,
+      phoneNumbers: (s.phoneNumbers || []).filter((p) => p.id !== id),
+    }));
   }
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.5)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 95,
-        padding: 20,
-        boxSizing: "border-box",
-      }}
-      onClick={onClose}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: "#fff",
-          color: "#222",
-          borderRadius: 16,
-          padding: 20,
-          width: "100%",
-          maxWidth: 440,
-          maxHeight: "88vh",
-          overflowY: "auto",
-          boxSizing: "border-box",
-        }}
-      >
-        {membersEnabled && (
-          <>
-            <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>
-              👥 Family members
-            </div>
-            <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-              {isAdmin
-                ? "You're the admin. Anyone new who opens the hub lands in the queue below and can't see anything until you approve them."
-                : "You're signed in as a family member. Only the admin can approve new people."}
-            </div>
-
-            {me && (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  border: "1px solid #EDEAF3",
-                  borderRadius: 9,
-                  padding: "9px 12px",
-                  marginBottom: 14,
-                }}
-              >
-                <div>
-                  <div style={{ fontSize: 12.5, fontWeight: 700 }}>
-                    {me.name} {isAdmin && <span style={{ color: "#4B2E83" }}>★ admin</span>}
-                  </div>
-                  <div style={{ fontSize: 11.5, color: "#8A8494" }}>{me.email}</div>
-                </div>
-                <button
-                  onClick={onSwitchMember}
-                  style={{
-                    background: "transparent",
-                    border: "1px solid #E0DCE8",
-                    borderRadius: 7,
-                    padding: "6px 12px",
-                    fontSize: 12,
-                    fontWeight: 700,
-                    cursor: "pointer",
-                    color: "#8A2E2E",
-                  }}
-                >
-                  Sign out
-                </button>
-              </div>
-            )}
-
-            {isAdmin && (
-              <>
-                {members.filter((m) => m.status === "pending").length > 0 && (
-                  <div style={{ marginBottom: 16 }}>
-                    <div style={{ fontSize: 12, fontWeight: 800, color: "#7A5A1A", marginBottom: 8 }}>
-                      ⏳ WAITING FOR YOUR APPROVAL
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                      {members
-                        .filter((m) => m.status === "pending")
-                        .map((m) => (
-                          <div
-                            key={m.id}
-                            style={{
-                              border: "1px solid #F5D9A8",
-                              background: "#FFF9EF",
-                              borderRadius: 9,
-                              padding: "10px 12px",
-                            }}
-                          >
-                            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
-                              {m.photo ? (
-                                <img
-                                  src={m.photo}
-                                  alt=""
-                                  style={{ width: 40, height: 40, borderRadius: "50%", objectFit: "cover" }}
-                                />
-                              ) : (
-                                <div
-                                  style={{
-                                    width: 40,
-                                    height: 40,
-                                    borderRadius: "50%",
-                                    background: "#F1EFF5",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    fontSize: 18,
-                                  }}
-                                >
-                                  👤
-                                </div>
-                              )}
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontSize: 13.5, fontWeight: 700 }}>{m.name}</div>
-                                <div style={{ fontSize: 11.5, color: "#8A8494" }}>{m.email}</div>
-                              </div>
-                            </div>
-                            <div style={{ fontSize: 12, color: "#5A5468", marginBottom: 8, lineHeight: 1.5 }}>
-                              {m.relationship && (
-                                <div>
-                                  <strong>Relationship:</strong> {m.relationship}
-                                </div>
-                              )}
-                              {m.phone && (
-                                <div>
-                                  <strong>Phone:</strong> {m.phone}
-                                </div>
-                              )}
-                              {m.kids && m.kids.length > 0 && (
-                                <div>
-                                  <strong>Here for:</strong> {m.kids.map((k) => THEMES[k].name).join(" & ")}
-                                </div>
-                              )}
-                              {m.note && (
-                                <div style={{ fontStyle: "italic", marginTop: 4 }}>“{m.note}”</div>
-                              )}
-                            </div>
-                            <div style={{ fontSize: 10.5, fontWeight: 800, color: "#7A5A1A", marginBottom: 6 }}>
-                              APPROVE AS
-                            </div>
-                            <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
-                              {Object.entries(PERMISSION_PRESETS).map(([key, preset]) => (
-                                <button
-                                  key={key}
-                                  onClick={() => onApproveMember(m.id, key)}
-                                  title={preset.hint}
-                                  style={{
-                                    flex: "1 1 auto",
-                                    background: "#2E7D32",
-                                    color: "#fff",
-                                    border: "none",
-                                    borderRadius: 7,
-                                    padding: "8px 10px",
-                                    fontSize: 12,
-                                    fontWeight: 700,
-                                    cursor: "pointer",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                >
-                                  ✓ {preset.label}
-                                </button>
-                              ))}
-                            </div>
-                            <div style={{ fontSize: 10.5, color: "#8A8494", marginBottom: 8, lineHeight: 1.4 }}>
-                              You can fine-tune exactly what they see afterward.
-                            </div>
-                            <button
-                              onClick={() => onDenyMember(m.id)}
-                              style={{
-                                width: "100%",
-                                background: "transparent",
-                                color: "#8A2E2E",
-                                border: "1.5px solid #E8B4B4",
-                                borderRadius: 7,
-                                padding: "8px 0",
-                                fontSize: 12.5,
-                                fontWeight: 700,
-                                cursor: "pointer",
-                              }}
-                            >
-                              ✕ Deny
-                            </button>
-                          </div>
-                        ))}
-                    </div>
-                  </div>
-                )}
-
-                <div style={{ fontSize: 12, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
-                  APPROVED ({members.filter((m) => m.status === "approved").length})
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
-                  {members
-                    .filter((m) => m.status === "approved")
-                    .map((m) => (
-                      <MemberRow
-                        key={m.id}
-                        member={m}
-                        onRemove={onRemoveMember}
-                        onSetPermissions={onSetPermissions}
-                      />
-                    ))}
-                </div>
-
-                {members.filter((m) => m.status === "denied").length > 0 && (
-                  <>
-                    <div style={{ fontSize: 12, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
-                      DENIED ({members.filter((m) => m.status === "denied").length})
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
-                      {members
-                        .filter((m) => m.status === "denied")
-                        .map((m) => (
-                          <div
-                            key={m.id}
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "space-between",
-                              border: "1px solid #EDEAF3",
-                              borderRadius: 9,
-                              padding: "8px 12px",
-                              opacity: 0.7,
-                            }}
-                          >
-                            <div style={{ fontSize: 12.5 }}>
-                              {m.name}{" "}
-                              <span style={{ color: "#8A8494" }}>{m.email}</span>
-                            </div>
-                            <div style={{ display: "flex", gap: 6 }}>
-                              <button
-                                onClick={() => onApproveMember(m.id)}
-                                style={{
-                                  background: "transparent",
-                                  border: "1px solid #BFE0C0",
-                                  borderRadius: 6,
-                                  padding: "4px 8px",
-                                  fontSize: 11,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                  color: "#2E7D32",
-                                }}
-                              >
-                                Allow
-                              </button>
-                              <button
-                                onClick={() => onRemoveMember(m.id)}
-                                style={{
-                                  background: "transparent",
-                                  border: "1px solid #E0DCE8",
-                                  borderRadius: 6,
-                                  padding: "4px 8px",
-                                  fontSize: 11,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                  color: "#8A8494",
-                                }}
-                              >
-                                Clear
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-                    </div>
-                  </>
-                )}
-
-                <div
-                  style={{
-                    background: "#FFF4E5",
-                    border: "1px solid #F5D9A8",
-                    borderRadius: 10,
-                    padding: "10px 12px",
-                    fontSize: 11.5,
-                    color: "#7A5A1A",
-                    marginBottom: 22,
-                    lineHeight: 1.5,
-                  }}
-                >
-                  ⓘ Worth knowing: this is an access-request list, not password login. It keeps
-                  casual visitors out and lets you control who's in, but it isn't strong security —
-                  someone technical who has the link could work around it. Don't post the link
-                  publicly, and don't put anything in here you'd be upset to have seen.
-                </div>
-              </>
-            )}
-
-            <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
-          </>
-        )}
-
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>👤 Google Sign-In (real auth)</div>
-        <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-          This is normally pre-configured for the whole family (baked into the site itself, same
-          as the sync URL below) — every visitor should already see the sign-in screen without
-          anyone needing to paste anything in here. This field is mainly for troubleshooting.
-          Requires Shared sync to be on. The real access control — who's allowed in — lives in
-          your Apps Script's allow-list, not here (see the README).
+    <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <div style={{ fontSize: 20, fontWeight: 900 }}>Admin</div>
+        <div style={{ fontSize: 13, color: "#8A8494", marginTop: 2 }}>
+          Signed in as {me.name} · {me.email}
         </div>
+      </div>
 
-        {googleAuth && (
-          <div
+      <div style={{ display: "flex", background: "#E7E4EE", borderRadius: 9, padding: 3 }}>
+        {[
+          { id: "people", label: `People${pending.length ? ` (${pending.length})` : ""}` },
+          { id: "reminders", label: "Reminders" },
+          { id: "system", label: "System" },
+        ].map((tabDef) => (
+          <button
+            key={tabDef.id}
+            onClick={() => setSection(tabDef.id)}
             style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              border: "1px solid #EDEAF3",
-              borderRadius: 9,
-              padding: "9px 12px",
-              marginBottom: 14,
+              flex: 1,
+              border: "none",
+              borderRadius: 7,
+              padding: "8px 0",
+              fontSize: 12.5,
+              fontWeight: 800,
+              cursor: "pointer",
+              background: section === tabDef.id ? "#fff" : "transparent",
+              color: section === tabDef.id ? "#232028" : "#8A8494",
+              boxShadow: section === tabDef.id ? "0 1px 2px rgba(0,0,0,0.08)" : "none",
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              {googleAuth.picture ? (
-                <img src={googleAuth.picture} alt="" style={{ width: 26, height: 26, borderRadius: "50%" }} />
-              ) : (
-                <span style={{ fontSize: 18 }}>👤</span>
-              )}
-              <div>
-                <div style={{ fontSize: 12.5, fontWeight: 700 }}>Signed in</div>
-                <div style={{ fontSize: 11.5, color: "#8A8494" }}>{googleAuth.email}</div>
+            {tabDef.label}
+          </button>
+        ))}
+      </div>
+
+      {section === "people" && (
+        <>
+          {pending.length > 0 && (
+            <SectionCard title={`⏳ Waiting for approval (${pending.length})`}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {pending.map((m) => (
+                  <div
+                    key={m.id}
+                    style={{
+                      border: "1px solid #F5D9A8",
+                      background: "#FFF9EF",
+                      borderRadius: 10,
+                      padding: 12,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                      {m.photo ? (
+                        <img
+                          src={m.photo}
+                          alt=""
+                          style={{ width: 42, height: 42, borderRadius: "50%", objectFit: "cover" }}
+                        />
+                      ) : (
+                        <div
+                          style={{
+                            width: 42,
+                            height: 42,
+                            borderRadius: "50%",
+                            background: "#F1EFF5",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            fontSize: 18,
+                          }}
+                        >
+                          👤
+                        </div>
+                      )}
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 700 }}>{m.name}</div>
+                        <div style={{ fontSize: 11.5, color: "#8A8494" }}>{m.email}</div>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 12, color: "#5A5468", marginBottom: 10, lineHeight: 1.5 }}>
+                      {m.relationship && (
+                        <div>
+                          <strong>Relationship:</strong> {m.relationship}
+                        </div>
+                      )}
+                      {m.phone && (
+                        <div>
+                          <strong>Phone:</strong> {m.phone}
+                        </div>
+                      )}
+                      {m.kids && m.kids.length > 0 && (
+                        <div>
+                          <strong>Here for:</strong> {m.kids.map((k) => THEMES[k].name).join(" & ")}
+                        </div>
+                      )}
+                      {m.note && <div style={{ fontStyle: "italic", marginTop: 4 }}>“{m.note}”</div>}
+                    </div>
+                    <div style={{ fontSize: 10.5, fontWeight: 800, color: "#7A5A1A", marginBottom: 6 }}>
+                      APPROVE AS
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+                      {Object.entries(PERMISSION_PRESETS).map(([key, preset]) => (
+                        <button
+                          key={key}
+                          onClick={() => onApproveMember(m.id, key)}
+                          title={preset.hint}
+                          style={{
+                            flex: "1 1 auto",
+                            background: "#2E7D32",
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: 7,
+                            padding: "8px 10px",
+                            fontSize: 12,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          ✓ {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      onClick={() => onDenyMember(m.id)}
+                      style={{
+                        width: "100%",
+                        background: "transparent",
+                        color: "#8A2E2E",
+                        border: "1.5px solid #E8B4B4",
+                        borderRadius: 7,
+                        padding: "8px 0",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        cursor: "pointer",
+                      }}
+                    >
+                      ✕ Deny
+                    </button>
+                  </div>
+                ))}
               </div>
+            </SectionCard>
+          )}
+
+          <SectionCard title={`Approved (${approved.length})`}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {approved.length === 0 && <EmptyLine text="Nobody approved yet." />}
+              {approved.map((m) => (
+                <MemberRow
+                  key={m.id}
+                  member={m}
+                  onRemove={onRemoveMember}
+                  onSetPermissions={onSetPermissions}
+                />
+              ))}
             </div>
+          </SectionCard>
+
+          {denied.length > 0 && (
+            <SectionCard title={`Denied (${denied.length})`}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {denied.map((m) => (
+                  <div
+                    key={m.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      border: "1px solid #EDEAF3",
+                      borderRadius: 9,
+                      padding: "8px 12px",
+                      opacity: 0.75,
+                      gap: 8,
+                    }}
+                  >
+                    <div style={{ fontSize: 12.5, minWidth: 0 }}>
+                      {m.name} <span style={{ color: "#8A8494" }}>{m.email}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                      <button
+                        onClick={() => onApproveMember(m.id, "viewer")}
+                        style={{
+                          background: "transparent",
+                          border: "1px solid #BFE0C0",
+                          borderRadius: 6,
+                          padding: "4px 9px",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          cursor: "pointer",
+                          color: "#2E7D32",
+                        }}
+                      >
+                        Allow
+                      </button>
+                      <button
+                        onClick={() => onRemoveMember(m.id)}
+                        style={{
+                          background: "transparent",
+                          border: "1px solid #E0DCE8",
+                          borderRadius: 6,
+                          padding: "4px 9px",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          cursor: "pointer",
+                          color: "#8A8494",
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </SectionCard>
+          )}
+
+          <div
+            style={{
+              background: "#FFF4E5",
+              border: "1px solid #F5D9A8",
+              borderRadius: 10,
+              padding: "11px 13px",
+              fontSize: 11.5,
+              color: "#7A5A1A",
+              lineHeight: 1.5,
+            }}
+          >
+            ⓘ Permissions here control what each person sees in the app. It's the right level of
+            control for family, but it isn't server-enforced — someone technical with the sync URL
+            could still read the underlying file. Don't post the link publicly.
+          </div>
+        </>
+      )}
+
+      {section === "reminders" && (
+        <SectionCard title="📱 Text reminder numbers">
+          <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 14, lineHeight: 1.5 }}>
+            Save numbers here, then pick which ones get a reminder when you add an event.
+          </div>
+
+          <div
+            style={{
+              background: "#F7F5FB",
+              border: "1px solid #E7E1F5",
+              borderRadius: 10,
+              padding: "10px 12px",
+              fontSize: 11.5,
+              color: "#5A5468",
+              marginBottom: 16,
+              lineHeight: 1.5,
+            }}
+          >
+            ⓘ The app saves reminder preferences but can't actually send texts on its own — that
+            needs a messaging service like Twilio wired up.
+          </div>
+
+          {phoneNumbers.length > 0 && (
+            <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+              {phoneNumbers.map((pn) => (
+                <div
+                  key={pn.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    border: "1px solid #EDEAF3",
+                    borderRadius: 9,
+                    padding: "9px 12px",
+                  }}
+                >
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{pn.label}</div>
+                    <div style={{ fontSize: 12, color: "#8A8494" }}>{pn.number}</div>
+                  </div>
+                  <button
+                    onClick={() => removeNumber(pn.id)}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "#8A2E2E",
+                      cursor: "pointer",
+                      fontSize: 13,
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <input
+            type="text"
+            placeholder="Label — e.g. Mom, Dad, Grandma"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            style={inputStyle(NEUTRAL)}
+          />
+          <input
+            type="tel"
+            placeholder="Phone number"
+            value={number}
+            onChange={(e) => setNumber(e.target.value)}
+            style={inputStyle(NEUTRAL)}
+          />
+          <button
+            onClick={addNumber}
+            disabled={!label.trim() || !number.trim()}
+            style={{
+              width: "100%",
+              background: label.trim() && number.trim() ? "#4B2E83" : "#E7E1F5",
+              color: label.trim() && number.trim() ? "#fff" : "#A8A2BC",
+              border: "none",
+              borderRadius: 9,
+              padding: "11px 0",
+              fontWeight: 800,
+              fontSize: 14,
+              cursor: label.trim() && number.trim() ? "pointer" : "not-allowed",
+            }}
+          >
+            + Add number
+          </button>
+        </SectionCard>
+      )}
+
+      {section === "system" && (
+        <>
+          <SectionCard title="🔄 Sync status">
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+              {syncStatus === "syncing" && "🔄 Syncing…"}
+              {syncStatus === "synced" &&
+                `🟢 Synced${lastSynced ? " · " + lastSynced.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : ""}`}
+              {syncStatus === "error" && "🔴 Can't reach the shared file — changes are local only"}
+              {syncStatus === "idle" && "Sync isn't configured"}
+            </div>
+            <div style={{ fontSize: 11.5, color: "#8A8494", lineHeight: 1.5 }}>
+              Everything is stored in one JSON file in your Google Drive. Each save replaces the
+              whole file, so if two people save at the same instant, one change can overwrite the
+              other.
+            </div>
+          </SectionCard>
+
+          <SectionCard title="Your account">
             <button
-              onClick={onSignOut}
+              onClick={onSwitchMember}
               style={{
                 background: "transparent",
-                border: "1px solid #E0DCE8",
-                borderRadius: 7,
-                padding: "6px 12px",
-                fontSize: 12,
+                border: "1.5px solid #E0DCE8",
+                borderRadius: 9,
+                padding: "11px 16px",
                 fontWeight: 700,
+                fontSize: 13.5,
                 cursor: "pointer",
                 color: "#8A2E2E",
               }}
             >
               Sign out
             </button>
-          </div>
-        )}
-
-        <input
-          type="text"
-          value={clientIdInput}
-          onChange={(e) => setClientIdInput(e.target.value)}
-          placeholder="xxxxxxxx.apps.googleusercontent.com"
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 8,
-            padding: "10px 12px",
-            fontSize: 13,
-            marginBottom: 10,
-            fontFamily: "inherit",
-          }}
-        />
-        <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
-          <button
-            onClick={saveClientId}
-            disabled={!clientIdInput.trim() || clientIdInput.trim() === settings.googleClientId}
-            style={{
-              flex: 1,
-              background: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "#4B2E83" : "#E7E1F5",
-              color: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "#fff" : "#A8A2BC",
-              border: "none",
-              borderRadius: 9,
-              padding: "10px 0",
-              fontWeight: 800,
-              fontSize: 13.5,
-              cursor: clientIdInput.trim() && clientIdInput.trim() !== settings.googleClientId ? "pointer" : "not-allowed",
-            }}
-          >
-            Save
-          </button>
-          {settings.googleClientId && (
-            <button
-              onClick={clearClientId}
-              style={{
-                flex: 1,
-                background: "transparent",
-                border: "1.5px solid #E0DCE8",
-                borderRadius: 9,
-                padding: "10px 0",
-                fontWeight: 700,
-                fontSize: 13.5,
-                cursor: "pointer",
-                color: "#8A2E2E",
-              }}
-            >
-              Turn off
-            </button>
-          )}
-        </div>
-        <div
-          style={{
-            background: "#F7F5FB",
-            border: "1px solid #E7E1F5",
-            borderRadius: 10,
-            padding: "10px 12px",
-            fontSize: 11.5,
-            color: "#5A5468",
-            marginBottom: 22,
-            lineHeight: 1.5,
-          }}
-        >
-          ⓘ The actual allow-list (which Google accounts get in) lives in your
-          Apps Script's <code>ALLOWED_EMAILS</code> list, not here — that's what
-          makes this real security instead of a client-side-only check. Editing
-          it here would defeat the point, so we don't offer that here on
-          purpose.
-        </div>
-
-        <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
-
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>🔒 Family access code</div>
-        <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-          Set a shared code so only people you give it to can open this hub. Once someone enters
-          it right, their device stays unlocked until you lock it again or they clear their
-          browser data.
-          {settings.googleClientId && (
-            <>
-              {" "}
-              <strong>Google Sign-In above is turned on, so it takes over from this passcode
-              gate</strong> for anyone who has it configured.
-            </>
-          )}
-        </div>
-        <input
-          type="text"
-          value={codeInput}
-          onChange={(e) => setCodeInput(e.target.value)}
-          placeholder="e.g. HHRaiders27"
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 8,
-            padding: "10px 12px",
-            fontSize: 14,
-            marginBottom: 10,
-            fontFamily: "inherit",
-          }}
-        />
-        <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-          <button
-            onClick={saveCode}
-            disabled={!codeInput.trim()}
-            style={{
-              flex: 1,
-              background: codeInput.trim() ? "#4B2E83" : "#E7E1F5",
-              color: codeInput.trim() ? "#fff" : "#A8A2BC",
-              border: "none",
-              borderRadius: 9,
-              padding: "10px 0",
-              fontWeight: 800,
-              fontSize: 13.5,
-              cursor: codeInput.trim() ? "pointer" : "not-allowed",
-            }}
-          >
-            {settings.accessCode ? "Update code" : "Turn on access code"}
-          </button>
-          {settings.accessCode && (
-            <button
-              onClick={removeCode}
-              style={{
-                flex: 1,
-                background: "transparent",
-                border: "1.5px solid #E0DCE8",
-                borderRadius: 9,
-                padding: "10px 0",
-                fontWeight: 700,
-                fontSize: 13.5,
-                cursor: "pointer",
-                color: "#8A2E2E",
-              }}
-            >
-              Turn off
-            </button>
-          )}
-        </div>
-        {settings.accessCode && (
-          <button
-            onClick={lockNow}
-            style={{
-              width: "100%",
-              background: "transparent",
-              border: "1.5px solid #E0DCE8",
-              borderRadius: 9,
-              padding: "9px 0",
-              fontWeight: 700,
-              fontSize: 12.5,
-              cursor: "pointer",
-              color: "#4B2E83",
-              marginBottom: 14,
-            }}
-          >
-            Lock this device now
-          </button>
-        )}
-        <div
-          style={{
-            background: "#FFF4E5",
-            border: "1px solid #F5D9A8",
-            borderRadius: 10,
-            padding: "10px 12px",
-            fontSize: 11.5,
-            color: "#7A5A1A",
-            marginBottom: 22,
-            lineHeight: 1.5,
-          }}
-        >
-          ⓘ Heads up: this is a simple shared passcode, not real individual accounts. It's a
-          reasonable speed bump so a random link isn't wide open, but it's not strong security —
-          anyone with access to this device or its browser storage could get past it. True private
-          logins for each person would need a real backend server, which a browser-only file like
-          this can't provide on its own.
-        </div>
-
-        <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
-
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>🔄 Shared sync (Google Drive)</div>
-        <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
-          This is normally pre-configured for the whole family (baked into the site itself), so
-          you shouldn't need to touch it. This field is here mainly for troubleshooting or
-          pointing this one device at a different sync file temporarily.
-        </div>
-        <input
-          type="text"
-          value={syncInput}
-          onChange={(e) => setSyncInput(e.target.value)}
-          placeholder="https://script.google.com/macros/s/.../exec"
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 8,
-            padding: "10px 12px",
-            fontSize: 13,
-            marginBottom: 10,
-            fontFamily: "inherit",
-          }}
-        />
-        <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-          <button
-            onClick={saveSyncUrl}
-            disabled={!syncInput.trim() || syncInput.trim() === settings.syncUrl}
-            style={{
-              flex: 1,
-              background: syncInput.trim() && syncInput.trim() !== settings.syncUrl ? "#4B2E83" : "#E7E1F5",
-              color: syncInput.trim() && syncInput.trim() !== settings.syncUrl ? "#fff" : "#A8A2BC",
-              border: "none",
-              borderRadius: 9,
-              padding: "10px 0",
-              fontWeight: 800,
-              fontSize: 13.5,
-              cursor: syncInput.trim() && syncInput.trim() !== settings.syncUrl ? "pointer" : "not-allowed",
-            }}
-          >
-            Save & sync
-          </button>
-          {settings.syncUrl && (
-            <button
-              onClick={clearSyncUrl}
-              style={{
-                flex: 1,
-                background: "transparent",
-                border: "1.5px solid #E0DCE8",
-                borderRadius: 9,
-                padding: "10px 0",
-                fontWeight: 700,
-                fontSize: 13.5,
-                cursor: "pointer",
-                color: "#8A2E2E",
-              }}
-            >
-              Turn off sync
-            </button>
-          )}
-        </div>
-        {settings.syncUrl && (
-          <div style={{ fontSize: 12, color: "#565064", marginBottom: 12, fontWeight: 600 }}>
-            {syncStatus === "syncing" && "🔄 Syncing…"}
-            {syncStatus === "synced" &&
-              `🟢 Synced${lastSynced ? " · " + lastSynced.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : ""}`}
-            {syncStatus === "error" && "🔴 Couldn't reach the sync URL — check your connection or the URL above."}
-          </div>
-        )}
-        <div
-          style={{
-            background: "#F7F5FB",
-            border: "1px solid #E7E1F5",
-            borderRadius: 10,
-            padding: "10px 12px",
-            fontSize: 11.5,
-            color: "#5A5468",
-            marginBottom: 22,
-            lineHeight: 1.5,
-          }}
-        >
-          ⓘ This replaces the whole shared file on every save (last save wins) — it's not built
-          for two people editing the exact same thing at the same instant. Fine for normal family
-          use; if two devices save within the same second or two, one change could get overwritten.
-          Each device still keeps a local backup, so nothing's lost on your own phone.
-        </div>
-
-        <div style={{ height: 1, background: "#EDEAF3", marginBottom: 20 }} />
-
-        <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>📱 Text reminder settings</div>
-        <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 16, lineHeight: 1.5 }}>
-          Save your number and any other parent's number here. When you add an event, you can
-          choose which of these numbers gets a text reminder — and when.
-        </div>
-
-        <div
-          style={{
-            background: "#F7F5FB",
-            border: "1px solid #E7E1F5",
-            borderRadius: 10,
-            padding: "10px 12px",
-            fontSize: 11.5,
-            color: "#5A5468",
-            marginBottom: 16,
-            lineHeight: 1.5,
-          }}
-        >
-          ⓘ This app runs entirely in your browser, so it can save reminder preferences here but
-          can't send actual texts on its own — that needs a connected messaging service (like
-          Twilio). Ask Claude to help wire that up whenever you're ready.
-        </div>
-
-        {phoneNumbers.length > 0 && (
-          <div style={{ marginBottom: 16, display: "flex", flexDirection: "column", gap: 8 }}>
-            {phoneNumbers.map((p) => (
-              <div
-                key={p.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  border: "1px solid #EDEAF3",
-                  borderRadius: 9,
-                  padding: "9px 12px",
-                }}
-              >
-                <div>
-                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>{p.label}</div>
-                  <div style={{ fontSize: 12, color: "#8A8494" }}>{p.number}</div>
-                </div>
-                <button
-                  onClick={() => removeNumber(p.id)}
-                  style={{ background: "none", border: "none", color: "#8A2E2E", cursor: "pointer", fontSize: 13 }}
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 8 }}>Add a number</div>
-        <input
-          type="text"
-          placeholder="Label — e.g. Mom, Dad, Grandma"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 8,
-            padding: "10px 12px",
-            fontSize: 14,
-            marginBottom: 10,
-            fontFamily: "inherit",
-          }}
-        />
-        <input
-          type="tel"
-          placeholder="Phone number — e.g. (512) 555-0134"
-          value={number}
-          onChange={(e) => setNumber(e.target.value)}
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 8,
-            padding: "10px 12px",
-            fontSize: 14,
-            marginBottom: 14,
-            fontFamily: "inherit",
-          }}
-        />
-        <button
-          onClick={addNumber}
-          disabled={!label.trim() || !number.trim()}
-          style={{
-            width: "100%",
-            background: label.trim() && number.trim() ? "#4B2E83" : "#E7E1F5",
-            color: label.trim() && number.trim() ? "#fff" : "#A8A2BC",
-            border: "none",
-            borderRadius: 9,
-            padding: "11px 0",
-            fontWeight: 800,
-            fontSize: 14,
-            cursor: label.trim() && number.trim() ? "pointer" : "not-allowed",
-            marginBottom: 10,
-          }}
-        >
-          + Add number
-        </button>
-
-        <button
-          onClick={onClose}
-          style={{
-            width: "100%",
-            background: "transparent",
-            border: "1.5px solid #E7E1F5",
-            borderRadius: 9,
-            padding: "11px 0",
-            fontWeight: 700,
-            fontSize: 14,
-            cursor: "pointer",
-            color: "#222",
-          }}
-        >
-          Done
-        </button>
-      </div>
+          </SectionCard>
+        </>
+      )}
     </div>
   );
 }
