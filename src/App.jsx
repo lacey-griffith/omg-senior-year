@@ -10,9 +10,9 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
    ============================================================ */
 const APP_CONFIG = {
   syncUrl: "https://script.google.com/macros/s/AKfycbyxcKaqCOjBCGZgny8K9p9jX3CVzN13TPpes8ptL6ziEzZ6agqHhAV_MXruCyt6KOembQ/exec",
-  googleClientId: "845495850293-2vs464h543k1mdgke0oq6iig3pjqc4qt.apps.googleusercontent.com",
+  googleClientId: "",
+  adminEmail: "",
 };
-
 
 /* ============================================================
    SENIOR YEAR HUB — two-kid edition
