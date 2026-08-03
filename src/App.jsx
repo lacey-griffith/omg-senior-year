@@ -180,6 +180,80 @@ const DEFAULT_BUDGET_CATEGORIES = [
   { id: "logistics", label: "Logistics", budgeted: 0, spent: 0 },
 ];
 
+/* ---------- Permissions ----------
+   What a given member can see and do. The admin always has everything;
+   these control everyone else. Defaults are deliberately conservative:
+   a newly approved person can see events and the gallery and submit photos,
+   but not the party budget or the member list. */
+const PERMISSIONS = [
+  { id: "viewEvents", label: "See events & calendar", hint: "Both kids' schedules" },
+  { id: "addEvents", label: "Add & edit events", hint: "Including Quick Add" },
+  { id: "viewGallery", label: "See photo gallery", hint: "Approved photos + slideshow" },
+  { id: "submitPhotos", label: "Submit photos", hint: "Goes to your approval queue" },
+  { id: "approvePhotos", label: "Approve submitted photos", hint: "Moderation rights" },
+  { id: "viewParty", label: "See grad party planner", hint: "Checklist and to-dos" },
+  { id: "viewBudget", label: "See party budget", hint: "Dollar amounts" },
+  { id: "editParty", label: "Edit party plans & budget", hint: "Check off tasks, change numbers" },
+  { id: "viewMilestones", label: "See milestone progress", hint: "On each kid's home tab" },
+];
+
+const DEFAULT_MEMBER_PERMISSIONS = {
+  viewEvents: true,
+  addEvents: false,
+  viewGallery: true,
+  submitPhotos: true,
+  approvePhotos: false,
+  viewParty: false,
+  viewBudget: false,
+  editParty: false,
+  viewMilestones: true,
+};
+
+// Handy starting points the admin can apply in one tap.
+const PERMISSION_PRESETS = {
+  viewer: {
+    label: "Viewer",
+    hint: "Can look, can submit photos",
+    perms: { ...DEFAULT_MEMBER_PERMISSIONS },
+  },
+  contributor: {
+    label: "Contributor",
+    hint: "Can also add events & see party plans",
+    perms: {
+      ...DEFAULT_MEMBER_PERMISSIONS,
+      addEvents: true,
+      viewParty: true,
+    },
+  },
+  coParent: {
+    label: "Co-parent",
+    hint: "Everything except managing members",
+    perms: {
+      viewEvents: true,
+      addEvents: true,
+      viewGallery: true,
+      submitPhotos: true,
+      approvePhotos: true,
+      viewParty: true,
+      viewBudget: true,
+      editParty: true,
+      viewMilestones: true,
+    },
+  },
+};
+
+function permsFor(member, isAdmin) {
+  // Admin bypasses the whole system — always full access.
+  if (isAdmin) {
+    const all = {};
+    PERMISSIONS.forEach((p) => {
+      all[p.id] = true;
+    });
+    return all;
+  }
+  return { ...DEFAULT_MEMBER_PERMISSIONS, ...((member && member.permissions) || {}) };
+}
+
 const PHOTO_TAGS = [
   { id: "grad-slideshow", label: "Grad Slideshow" },
   { id: "to-print", label: "To Print" },
@@ -590,10 +664,22 @@ export default function SeniorYearHub() {
   // and it still works if the members list is ever wiped.
   const isAdmin = !!(me && adminEmail && me.email.trim().toLowerCase() === adminEmail);
   const pendingCount = members.filter((m) => m.status === "pending").length;
+  const perms = permsFor(me, isAdmin);
 
-  function requestAccess(name, email) {
-    const cleanName = name.trim();
-    const cleanEmail = email.trim();
+  function setMemberPermissions(id, nextPerms) {
+    updateSettings((s) => ({
+      ...s,
+      members: (s.members || []).map((m) =>
+        m.id === id ? { ...m, permissions: nextPerms } : m
+      ),
+    }));
+  }
+
+  // Called from the signup wizard's final step with the whole profile at once.
+  // Nothing touches the shared file until they submit, so half-finished
+  // signups from strangers never land in your data.
+  function requestAccess(profile) {
+    const cleanEmail = (profile.email || "").trim();
     const lower = cleanEmail.toLowerCase();
 
     // Already known? Just re-attach this device to that record rather than
@@ -609,8 +695,13 @@ export default function SeniorYearHub() {
     const isTheAdmin = !!adminEmail && lower === adminEmail;
     const newMember = {
       id,
-      name: cleanName,
+      name: (profile.name || "").trim(),
       email: cleanEmail,
+      relationship: (profile.relationship || "").trim(),
+      phone: (profile.phone || "").trim(),
+      kids: profile.kids || [],
+      photo: profile.photo || null,
+      note: (profile.note || "").trim(),
       // The admin never waits on anyone; everyone else needs approval.
       status: isTheAdmin ? "approved" : "pending",
       role: isTheAdmin ? "admin" : "member",
@@ -621,10 +712,28 @@ export default function SeniorYearHub() {
     setMemberId(id);
   }
 
-  function approveMember(id) {
+  // Lets a returning member get back in from a new device without redoing
+  // the whole wizard — just match on email.
+  function findMemberByEmail(email) {
+    const lower = (email || "").trim().toLowerCase();
+    if (!lower) return null;
+    return members.find((m) => m.email.trim().toLowerCase() === lower) || null;
+  }
+
+  function resumeAsMember(id) {
+    saveMemberId(id);
+    setMemberId(id);
+  }
+
+  function approveMember(id, presetKey) {
+    const preset = PERMISSION_PRESETS[presetKey] || PERMISSION_PRESETS.viewer;
     updateSettings((s) => ({
       ...s,
-      members: (s.members || []).map((m) => (m.id === id ? { ...m, status: "approved" } : m)),
+      members: (s.members || []).map((m) =>
+        m.id === id
+          ? { ...m, status: "approved", permissions: { ...preset.perms } }
+          : m
+      ),
     }));
   }
 
@@ -658,7 +767,14 @@ export default function SeniorYearHub() {
 
   // Member flow: introduce yourself, then wait for the admin to approve.
   if (membersEnabled && !me) {
-    return <RequestAccessGate onRequest={requestAccess} adminEmail={adminEmail} />;
+    return (
+      <SignupWizard
+        onSubmit={requestAccess}
+        adminEmail={adminEmail}
+        findMemberByEmail={findMemberByEmail}
+        onResume={resumeAsMember}
+      />
+    );
   }
 
   if (membersEnabled && me && me.status === "pending") {
@@ -710,35 +826,60 @@ export default function SeniorYearHub() {
           store={store}
           jumpToKid={jumpToKid}
           updateProfilePic={updateProfilePic}
-          familyView={familyView}
+          familyView={familyView || !isAdmin}
+          perms={perms}
         />
       ) : (
         <>
-          <TopBar theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
+          <TopBar theme={theme} data={data} updateKid={updateKid} familyView={familyView} perms={perms} />
           <div style={{ flex: 1, paddingBottom: 84, maxWidth: 640, margin: "0 auto", width: "100%" }}>
-            {tab === "home" && <HomeTab theme={theme} data={data} setTab={setTab} />}
-            {tab === "events" && (
-              <EventsTab
-                theme={theme}
-                data={data}
-                updateKid={updateKid}
-                settings={store.settings || { phoneNumbers: [] }}
-                onOpenReminders={() => setShowReminders(true)}
-                familyView={familyView}
-                currentUser={me || googleAuth}
-              />
-            )}
-            {tab === "gallery" && (
-              <GalleryTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} currentUser={me || googleAuth} />
-            )}
-            {tab === "party" && (
-              <PartyTab theme={theme} data={data} updateKid={updateKid} familyView={familyView} />
-            )}
-            {tab === "submit" && (
-              <SubmitTab theme={theme} data={data} updateKid={updateKid} />
-            )}
+            {tab === "home" && <HomeTab theme={theme} data={data} setTab={setTab} perms={perms} />}
+            {tab === "events" &&
+              (perms.viewEvents ? (
+                <EventsTab
+                  theme={theme}
+                  data={data}
+                  updateKid={updateKid}
+                  settings={store.settings || { phoneNumbers: [] }}
+                  onOpenReminders={() => setShowReminders(true)}
+                  familyView={familyView || !perms.addEvents}
+                  currentUser={me || googleAuth}
+                />
+              ) : (
+                <NoAccessPanel theme={theme} what="events" />
+              ))}
+            {tab === "gallery" &&
+              (perms.viewGallery ? (
+                <GalleryTab
+                  theme={theme}
+                  data={data}
+                  updateKid={updateKid}
+                  familyView={familyView || !perms.approvePhotos}
+                  currentUser={me || googleAuth}
+                />
+              ) : (
+                <NoAccessPanel theme={theme} what="the photo gallery" />
+              ))}
+            {tab === "party" &&
+              (perms.viewParty ? (
+                <PartyTab
+                  theme={theme}
+                  data={data}
+                  updateKid={updateKid}
+                  familyView={familyView || !perms.editParty}
+                  perms={perms}
+                />
+              ) : (
+                <NoAccessPanel theme={theme} what="the party planner" />
+              ))}
+            {tab === "submit" &&
+              (perms.submitPhotos ? (
+                <SubmitTab theme={theme} data={data} updateKid={updateKid} />
+              ) : (
+                <NoAccessPanel theme={theme} what="photo submissions" />
+              ))}
           </div>
-          <BottomNav theme={theme} tab={tab} setTab={setTab} />
+          <BottomNav theme={theme} tab={tab} setTab={setTab} perms={perms} />
         </>
       )}
 
@@ -758,6 +899,7 @@ export default function SeniorYearHub() {
           onApproveMember={approveMember}
           onDenyMember={denyMember}
           onRemoveMember={removeMember}
+          onSetPermissions={setMemberPermissions}
 
           onSwitchMember={switchMember}
         />
@@ -903,69 +1045,421 @@ const GATE_INPUT_STYLE = {
   fontFamily: "inherit",
 };
 
-function RequestAccessGate({ onRequest, adminEmail }) {
+/* ---------- Signup wizard ----------
+   Four short steps. Everything is held in local component state until the
+   final submit, so an unapproved stranger never writes to the shared file
+   partway through. The admin sees the whole profile when reviewing. */
+const SIGNUP_STEPS = ["You", "Connection", "Photo", "Review"];
+
+function SignupWizard({ onSubmit, adminEmail, findMemberByEmail, onResume }) {
+  const [step, setStep] = useState(0);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [relationship, setRelationship] = useState("");
+  const [phone, setPhone] = useState("");
+  const [kids, setKids] = useState([]);
+  const [photo, setPhoto] = useState(null);
+  const [note, setNote] = useState("");
+  const [photoError, setPhotoError] = useState("");
+  const [returning, setReturning] = useState(null);
+  const fileRef = useRef(null);
 
-  const ready = name.trim().length > 0 && email.trim().length > 0;
-  // Give the admin a heads-up that they'll go straight in, so it doesn't feel
-  // like they're about to wait on themselves.
-  const isAdminEmail = !!adminEmail && email.trim().toLowerCase() === adminEmail;
+  const emailTrim = email.trim();
+  const isAdminEmail = !!adminEmail && emailTrim.toLowerCase() === adminEmail;
+
+  // If they've signed up before, don't make them redo the wizard.
+  function checkReturning(value) {
+    const found = findMemberByEmail(value);
+    setReturning(found || null);
+  }
+
+  function toggleKid(key) {
+    setKids((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  }
+
+  function handlePhoto(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setPhotoError("");
+    fileToCompressedDataUrl(file, 400, 0.85)
+      .then((dataUrl) => setPhoto(dataUrl))
+      .catch(() => setPhotoError("Couldn't load that photo — try a different one."));
+  }
+
+  function submit() {
+    onSubmit({ name, email, relationship, phone, kids, photo, note });
+  }
+
+  const step0Ready = name.trim().length > 0 && emailTrim.length > 0;
 
   return (
     <div style={GATE_WRAP_STYLE}>
-      <div style={GATE_CARD_STYLE}>
-        <div style={{ fontSize: 30, marginBottom: 6 }}>🔒</div>
-        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
-        <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
-          This family hub is private. Enter your name and email to continue — if you've been here
-          before, you'll go right back in.
+      <div style={{ ...GATE_CARD_STYLE, maxWidth: 420, textAlign: "left" }}>
+        <div style={{ textAlign: "center", marginBottom: 18 }}>
+          <div style={{ fontSize: 26, marginBottom: 4 }}>🎓</div>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>Senior Year Hub</div>
         </div>
 
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Your name"
-          autoFocus
-          style={GATE_INPUT_STYLE}
-        />
-        <input
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && ready && onRequest(name, email)}
-          placeholder="Your email"
-          style={{ ...GATE_INPUT_STYLE, marginBottom: 16 }}
-        />
-
-        <button
-          onClick={() => ready && onRequest(name, email)}
-          disabled={!ready}
-          style={{
-            width: "100%",
-            background: ready ? "#4B2E83" : "#E7E1F5",
-            color: ready ? "#fff" : "#A8A2BC",
-            border: "none",
-            borderRadius: 9,
-            padding: "12px 0",
-            fontWeight: 800,
-            fontSize: 14.5,
-            cursor: ready ? "pointer" : "not-allowed",
-          }}
-        >
-          Continue
-        </button>
-
-        <div style={{ fontSize: 11, color: "#A19DAF", marginTop: 14, lineHeight: 1.5 }}>
-          {isAdminEmail
-            ? "★ Admin account — you'll go straight in."
-            : "No password needed. New here? The family admin approves each person."}
+        {/* progress rail */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
+          {SIGNUP_STEPS.map((label, i) => (
+            <div key={label} style={{ flex: 1 }}>
+              <div
+                style={{
+                  height: 4,
+                  borderRadius: 4,
+                  background: i <= step ? "#4B2E83" : "#E7E1F5",
+                  transition: "background 0.2s ease",
+                }}
+              />
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  marginTop: 5,
+                  textAlign: "center",
+                  color: i <= step ? "#4B2E83" : "#C4BFD4",
+                }}
+              >
+                {label}
+              </div>
+            </div>
+          ))}
         </div>
+
+        {step === 0 && (
+          <>
+            <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 16, lineHeight: 1.5 }}>
+              This family hub is private. Let's start with who you are.
+            </div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 6 }}>
+              Your name
+            </div>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Betty White"
+              autoFocus
+              style={GATE_INPUT_STYLE}
+            />
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 6, marginTop: 4 }}>
+              Your email
+            </div>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                setReturning(null);
+              }}
+              onBlur={(e) => checkReturning(e.target.value)}
+              placeholder="you@example.com"
+              style={GATE_INPUT_STYLE}
+            />
+
+            {returning && (
+              <div
+                style={{
+                  background: "#F1EFF8",
+                  border: "1px solid #D9D2EC",
+                  borderRadius: 9,
+                  padding: "10px 12px",
+                  fontSize: 12.5,
+                  marginBottom: 12,
+                  lineHeight: 1.5,
+                }}
+              >
+                Welcome back, {returning.name}! You've signed up before.
+                <button
+                  onClick={() => onResume(returning.id)}
+                  style={{
+                    display: "block",
+                    marginTop: 8,
+                    background: "#4B2E83",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 7,
+                    padding: "8px 14px",
+                    fontSize: 12.5,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Continue as {returning.name.split(" ")[0]} →
+                </button>
+              </div>
+            )}
+
+            {isAdminEmail && (
+              <div style={{ fontSize: 11.5, color: "#4B2E83", fontWeight: 700, marginBottom: 12 }}>
+                ★ Admin account — you'll go straight in, no waiting.
+              </div>
+            )}
+
+            <WizardButtons
+              onNext={() => setStep(1)}
+              nextReady={step0Ready}
+              nextLabel="Next"
+            />
+          </>
+        )}
+
+        {step === 1 && (
+          <>
+            <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 16, lineHeight: 1.5 }}>
+              How do you know Tyler and Gracie? This helps the admin recognize you.
+            </div>
+
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 6 }}>
+              Relationship
+            </div>
+            <input
+              type="text"
+              value={relationship}
+              onChange={(e) => setRelationship(e.target.value)}
+              placeholder="e.g. Grandma, Aunt, Family friend"
+              autoFocus
+              style={GATE_INPUT_STYLE}
+            />
+
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 6, marginTop: 4 }}>
+              Phone <span style={{ fontWeight: 500 }}>(optional)</span>
+            </div>
+            <input
+              type="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="(512) 555-0134"
+              style={GATE_INPUT_STYLE}
+            />
+
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 8, marginTop: 4 }}>
+              Here for
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+              {Object.values(THEMES).map((t) => {
+                const on = kids.includes(t.key);
+                return (
+                  <button
+                    key={t.key}
+                    onClick={() => toggleKid(t.key)}
+                    style={{
+                      flex: 1,
+                      border: `1.5px solid ${on ? t.primary : "#E0DCE8"}`,
+                      background: on ? t.primary : "transparent",
+                      color: on ? "#fff" : "#565064",
+                      borderRadius: 9,
+                      padding: "10px 0",
+                      fontSize: 13,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {t.name}
+                  </button>
+                );
+              })}
+            </div>
+
+            <WizardButtons onBack={() => setStep(0)} onNext={() => setStep(2)} nextReady nextLabel="Next" />
+          </>
+        )}
+
+        {step === 2 && (
+          <>
+            <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 16, lineHeight: 1.5 }}>
+              Add a photo so everyone knows who's who. Totally optional.
+            </div>
+
+            <div
+              onClick={() => fileRef.current && fileRef.current.click()}
+              style={{
+                border: "2px dashed #D9D5E3",
+                borderRadius: 12,
+                padding: photo ? 12 : 28,
+                textAlign: "center",
+                cursor: "pointer",
+                marginBottom: 12,
+              }}
+            >
+              {photo ? (
+                <img
+                  src={photo}
+                  alt=""
+                  style={{ width: 88, height: 88, objectFit: "cover", borderRadius: "50%" }}
+                />
+              ) : (
+                <>
+                  <div style={{ fontSize: 26, marginBottom: 6 }}>📷</div>
+                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>Tap to add a photo</div>
+                </>
+              )}
+            </div>
+            <input ref={fileRef} type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} />
+            {photoError && (
+              <div style={{ fontSize: 12, color: "#B33A3A", fontWeight: 600, marginBottom: 10 }}>
+                {photoError}
+              </div>
+            )}
+            {photo && (
+              <button
+                onClick={() => setPhoto(null)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "#8A2E2E",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  padding: 0,
+                  marginBottom: 12,
+                }}
+              >
+                Remove photo
+              </button>
+            )}
+
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#8A8494", marginBottom: 6, marginTop: 4 }}>
+              Anything to add? <span style={{ fontWeight: 500 }}>(optional)</span>
+            </div>
+            <textarea
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="A quick hello for the admin"
+              rows={3}
+              style={{ ...GATE_INPUT_STYLE, resize: "vertical", marginBottom: 18 }}
+            />
+
+            <WizardButtons onBack={() => setStep(1)} onNext={() => setStep(3)} nextReady nextLabel="Review" />
+          </>
+        )}
+
+        {step === 3 && (
+          <>
+            <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 16, lineHeight: 1.5 }}>
+              {isAdminEmail
+                ? "Looks good? You'll go straight into the hub."
+                : "Here's what gets sent to the family admin for approval."}
+            </div>
+
+            <div
+              style={{
+                border: "1px solid #EDEAF3",
+                borderRadius: 12,
+                padding: 14,
+                marginBottom: 18,
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                {photo ? (
+                  <img
+                    src={photo}
+                    alt=""
+                    style={{ width: 46, height: 46, borderRadius: "50%", objectFit: "cover" }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: 46,
+                      height: 46,
+                      borderRadius: "50%",
+                      background: "#F1EFF5",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 20,
+                    }}
+                  >
+                    👤
+                  </div>
+                )}
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 800, fontSize: 14.5 }}>{name.trim()}</div>
+                  <div style={{ fontSize: 12, color: "#8A8494" }}>{emailTrim}</div>
+                </div>
+              </div>
+
+              <ReviewRow label="Relationship" value={relationship.trim() || "—"} />
+              <ReviewRow label="Phone" value={phone.trim() || "—"} />
+              <ReviewRow
+                label="Here for"
+                value={
+                  kids.length
+                    ? kids.map((k) => THEMES[k].name).join(" & ")
+                    : "—"
+                }
+              />
+              {note.trim() && <ReviewRow label="Note" value={note.trim()} />}
+            </div>
+
+            <WizardButtons
+              onBack={() => setStep(2)}
+              onNext={submit}
+              nextReady
+              nextLabel={isAdminEmail ? "Enter hub →" : "Send request"}
+            />
+          </>
+        )}
       </div>
     </div>
   );
 }
+
+function ReviewRow({ label, value }) {
+  return (
+    <div style={{ display: "flex", gap: 10, fontSize: 12.5 }}>
+      <div style={{ color: "#A19DAF", fontWeight: 700, width: 90, flexShrink: 0 }}>{label}</div>
+      <div style={{ color: "#232028", wordBreak: "break-word" }}>{value}</div>
+    </div>
+  );
+}
+
+function WizardButtons({ onBack, onNext, nextReady, nextLabel }) {
+  return (
+    <div style={{ display: "flex", gap: 10 }}>
+      {onBack && (
+        <button
+          onClick={onBack}
+          style={{
+            flex: 1,
+            background: "transparent",
+            border: "1.5px solid #E0DCE8",
+            borderRadius: 9,
+            padding: "12px 0",
+            fontWeight: 700,
+            fontSize: 14,
+            cursor: "pointer",
+            color: "#565064",
+          }}
+        >
+          Back
+        </button>
+      )}
+      <button
+        onClick={() => nextReady && onNext()}
+        disabled={!nextReady}
+        style={{
+          flex: onBack ? 2 : 1,
+          background: nextReady ? "#4B2E83" : "#E7E1F5",
+          color: nextReady ? "#fff" : "#A8A2BC",
+          border: "none",
+          borderRadius: 9,
+          padding: "12px 0",
+          fontWeight: 800,
+          fontSize: 14.5,
+          cursor: nextReady ? "pointer" : "not-allowed",
+        }}
+      >
+        {nextLabel}
+      </button>
+    </div>
+  );
+}
+
 
 function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
   return (
@@ -983,7 +1477,7 @@ function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
             background: "#F7F5FB",
             border: "1px solid #E7E1F5",
             borderRadius: 10,
-            padding: "10px 12px",
+            padding: "12px",
             fontSize: 12,
             color: "#5A5468",
             marginBottom: 16,
@@ -991,9 +1485,44 @@ function PendingApprovalScreen({ member, onSwitch, syncStatus }) {
             textAlign: "left",
           }}
         >
-          <div style={{ fontWeight: 700, marginBottom: 3 }}>Requested as</div>
-          <div>{member.name}</div>
-          <div style={{ color: "#8A8494" }}>{member.email}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+            {member.photo ? (
+              <img
+                src={member.photo}
+                alt=""
+                style={{ width: 38, height: 38, borderRadius: "50%", objectFit: "cover" }}
+              />
+            ) : (
+              <div
+                style={{
+                  width: 38,
+                  height: 38,
+                  borderRadius: "50%",
+                  background: "#E7E1F5",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 17,
+                }}
+              >
+                👤
+              </div>
+            )}
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 700 }}>{member.name}</div>
+              <div style={{ color: "#8A8494", fontSize: 11.5 }}>{member.email}</div>
+            </div>
+          </div>
+          {member.relationship && (
+            <div>
+              <strong>Relationship:</strong> {member.relationship}
+            </div>
+          )}
+          {member.kids && member.kids.length > 0 && (
+            <div>
+              <strong>Here for:</strong> {member.kids.map((k) => THEMES[k].name).join(" & ")}
+            </div>
+          )}
         </div>
 
         <button
@@ -1801,7 +2330,8 @@ function HeaderEditorModal({ theme, data, updateKid, onClose }) {
 /* ============================================================
    PARENT DASHBOARD — combined overview, jump-off point to each kid
    ============================================================ */
-function ParentDashboard({ store, jumpToKid, updateProfilePic, familyView }) {
+function ParentDashboard({ store, jumpToKid, updateProfilePic, familyView, perms }) {
+  const p = perms || {};
   const today = new Date().toISOString().slice(0, 10);
 
   const combinedUpcoming = useMemo(() => {
@@ -1843,6 +2373,7 @@ function ParentDashboard({ store, jumpToKid, updateProfilePic, familyView }) {
         ))}
       </div>
 
+      {p.viewEvents && (
       <SectionCard theme={{ card: "#fff", border: "#E7E4EE", text: "#232028", subtext: "#8A8494", primary: "#4B2E83", onPrimary: "#fff" }} title="Coming up — both kids">
         {combinedUpcoming.length === 0 && <EmptyLine text="Nothing on the calendar yet." />}
         {combinedUpcoming.map((e, i) => (
@@ -1888,8 +2419,9 @@ function ParentDashboard({ store, jumpToKid, updateProfilePic, familyView }) {
           </div>
         ))}
       </SectionCard>
+      )}
 
-      {combinedPending > 0 && (
+      {p.approvePhotos && combinedPending > 0 && (
         <div
           style={{
             background: "#FFF4E5",
@@ -2003,7 +2535,8 @@ function KidCard({ theme, data, onOpen, onProfilePic, familyView }) {
 /* ============================================================
    HOME TAB
    ============================================================ */
-function HomeTab({ theme, data, setTab }) {
+function HomeTab({ theme, data, setTab, perms }) {
+  const p = perms || {};
   const upcoming = useMemo(() => {
     const today = new Date().toISOString().slice(0, 10);
     return data.events
@@ -2015,51 +2548,57 @@ function HomeTab({ theme, data, setTab }) {
   const milestoneDone = data.milestones.filter((m) => m.done).length;
   const milestonePct = Math.round((milestoneDone / data.milestones.length) * 100);
 
-  const pendingPhotos = data.photos.filter((p) => !p.approved).length;
-  const approvedPhotos = data.photos.filter((p) => p.approved).length;
+  const pendingPhotos = data.photos.filter((p2) => !p2.approved).length;
+  const approvedPhotos = data.photos.filter((p2) => p2.approved).length;
 
   return (
     <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-      <SectionCard theme={theme} title="Coming up">
-        {upcoming.length === 0 && (
-          <EmptyLine text="No upcoming events yet — add one in the Events tab." />
-        )}
-        {upcoming.map((e, i) => (
-          <div
-            key={i}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              padding: "9px 0",
-              borderBottom: i < upcoming.length - 1 ? `1px solid ${theme.border}` : "none",
-            }}
-          >
-            <span style={{ fontWeight: 600, fontSize: 14 }}>{e.title}</span>
-            <span style={{ fontSize: 13, color: theme.subtext, fontWeight: 700, whiteSpace: "nowrap", marginLeft: 12 }}>
-              {fmtDate(e.date)}
-            </span>
-          </div>
-        ))}
-        <TapLink theme={theme} onClick={() => setTab("events")} label="See all events →" />
-      </SectionCard>
+      {p.viewEvents && (
+        <SectionCard theme={theme} title="Coming up">
+          {upcoming.length === 0 && (
+            <EmptyLine text="No upcoming events yet — add one in the Events tab." />
+          )}
+          {upcoming.map((e, i) => (
+            <div
+              key={i}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                padding: "9px 0",
+                borderBottom: i < upcoming.length - 1 ? `1px solid ${theme.border}` : "none",
+              }}
+            >
+              <span style={{ fontWeight: 600, fontSize: 14 }}>{e.title}</span>
+              <span style={{ fontSize: 13, color: theme.subtext, fontWeight: 700, whiteSpace: "nowrap", marginLeft: 12 }}>
+                {fmtDate(e.date)}
+              </span>
+            </div>
+          ))}
+          <TapLink theme={theme} onClick={() => setTab("events")} label="See all events →" />
+        </SectionCard>
+      )}
 
-      <SectionCard theme={theme} title="Milestone progress">
-        <ProgressBar theme={theme} pct={milestonePct} />
-        <div style={{ fontSize: 13, color: theme.subtext, marginTop: 8, fontWeight: 600 }}>
-          {milestoneDone} of {data.milestones.length} complete
-        </div>
-      </SectionCard>
+      {p.viewMilestones && (
+        <SectionCard theme={theme} title="Milestone progress">
+          <ProgressBar theme={theme} pct={milestonePct} />
+          <div style={{ fontSize: 13, color: theme.subtext, marginTop: 8, fontWeight: 600 }}>
+            {milestoneDone} of {data.milestones.length} complete
+          </div>
+        </SectionCard>
+      )}
 
       <div style={{ display: "flex", gap: 12 }}>
-        <StatBlock theme={theme} value={data.events.length} label="Events tracked" />
-        <StatBlock theme={theme} value={approvedPhotos} label="Photos in gallery" />
-        <StatBlock theme={theme} value={pendingPhotos} label="Pending review" />
+        {p.viewEvents && <StatBlock theme={theme} value={data.events.length} label="Events tracked" />}
+        {p.viewGallery && <StatBlock theme={theme} value={approvedPhotos} label="Photos in gallery" />}
+        {p.approvePhotos && <StatBlock theme={theme} value={pendingPhotos} label="Pending review" />}
       </div>
 
-      <SectionCard theme={theme} title="Grad party checklist">
-        <PartySummary theme={theme} data={data} />
-        <TapLink theme={theme} onClick={() => setTab("party")} label="Open party planner →" />
-      </SectionCard>
+      {p.viewParty && (
+        <SectionCard theme={theme} title="Grad party checklist">
+          <PartySummary theme={theme} data={data} />
+          <TapLink theme={theme} onClick={() => setTab("party")} label="Open party planner →" />
+        </SectionCard>
+      )}
     </div>
   );
 }
@@ -3814,7 +4353,8 @@ function MemoryBookView({ theme, data, photos, onClose, subtitle }) {
 /* ============================================================
    PARTY PLANNER TAB
    ============================================================ */
-function PartyTab({ theme, data, updateKid, familyView }) {
+function PartyTab({ theme, data, updateKid, familyView, perms }) {
+  const canSeeBudget = !perms || perms.viewBudget;
   const [view, setView] = useState("checklist"); // "checklist" | "budget"
 
   function toggle(key) {
@@ -3824,31 +4364,33 @@ function PartyTab({ theme, data, updateKid, familyView }) {
 
   return (
     <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-      <div style={{ display: "flex", background: theme.border, borderRadius: 9, padding: 3 }}>
-        {["checklist", "budget"].map((v) => (
-          <button
-            key={v}
-            onClick={() => setView(v)}
-            style={{
-              flex: 1,
-              border: "none",
-              borderRadius: 7,
-              padding: "8px 0",
-              fontSize: 13,
-              fontWeight: 800,
-              cursor: "pointer",
-              background: view === v ? theme.card : "transparent",
-              color: view === v ? theme.text : theme.subtext,
-              boxShadow: view === v ? "0 1px 2px rgba(0,0,0,0.08)" : "none",
-              textTransform: "capitalize",
-            }}
-          >
-            {v === "checklist" ? "✅ Checklist" : "💰 Budget"}
-          </button>
-        ))}
-      </div>
+      {canSeeBudget && (
+        <div style={{ display: "flex", background: theme.border, borderRadius: 9, padding: 3 }}>
+          {["checklist", "budget"].map((v) => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              style={{
+                flex: 1,
+                border: "none",
+                borderRadius: 7,
+                padding: "8px 0",
+                fontSize: 13,
+                fontWeight: 800,
+                cursor: "pointer",
+                background: view === v ? theme.card : "transparent",
+                color: view === v ? theme.text : theme.subtext,
+                boxShadow: view === v ? "0 1px 2px rgba(0,0,0,0.08)" : "none",
+                textTransform: "capitalize",
+              }}
+            >
+              {v === "checklist" ? "✅ Checklist" : "💰 Budget"}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {view === "checklist" ? (
+      {view === "checklist" || !canSeeBudget ? (
         <>
           {PARTY_CATEGORIES.map((cat) => {
             const doneCount = cat.items.filter((it) => data.party[`${cat.id}:${it}`]).length;
@@ -4223,6 +4765,229 @@ function TapLink({ theme, onClick, label }) {
   );
 }
 
+/* ---------- Admin: one member's row, expandable into a permission editor ---------- */
+function MemberRow({ member, onRemove, onSetPermissions }) {
+  const [open, setOpen] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const isAdminRow = member.role === "admin";
+  const current = { ...DEFAULT_MEMBER_PERMISSIONS, ...(member.permissions || {}) };
+  const grantedCount = PERMISSIONS.filter((p) => current[p.id]).length;
+
+  function togglePerm(id) {
+    onSetPermissions(member.id, { ...current, [id]: !current[id] });
+  }
+
+  function applyPreset(key) {
+    onSetPermissions(member.id, { ...PERMISSION_PRESETS[key].perms });
+  }
+
+  return (
+    <div style={{ border: "1px solid #EDEAF3", borderRadius: 9, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 12px", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          {member.photo ? (
+            <img
+              src={member.photo}
+              alt=""
+              style={{ width: 32, height: 32, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }}
+            />
+          ) : (
+            <div
+              style={{
+                width: 32,
+                height: 32,
+                borderRadius: "50%",
+                background: "#F1EFF5",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 14,
+                flexShrink: 0,
+              }}
+            >
+              👤
+            </div>
+          )}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 700 }}>
+              {member.name} {isAdminRow && <span style={{ color: "#4B2E83", fontSize: 11 }}>★ admin</span>}
+            </div>
+            <div
+              style={{
+                fontSize: 11.5,
+                color: "#8A8494",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {isAdminRow
+                ? "Full access"
+                : `${grantedCount} of ${PERMISSIONS.length} permissions`}
+            </div>
+          </div>
+        </div>
+        {!isAdminRow && (
+          <button
+            onClick={() => setOpen(!open)}
+            style={{
+              background: "transparent",
+              border: "1px solid #E0DCE8",
+              borderRadius: 6,
+              padding: "5px 10px",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+              color: "#4B2E83",
+              flexShrink: 0,
+            }}
+          >
+            {open ? "Done" : "Manage"}
+          </button>
+        )}
+      </div>
+
+      {open && !isAdminRow && (
+        <div style={{ borderTop: "1px solid #EDEAF3", padding: 12, background: "#FBFAFD" }}>
+          <div style={{ fontSize: 11, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
+            QUICK SET
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+            {Object.entries(PERMISSION_PRESETS).map(([key, preset]) => (
+              <button
+                key={key}
+                onClick={() => applyPreset(key)}
+                title={preset.hint}
+                style={{
+                  border: "1.5px solid #D9D2EC",
+                  background: "#fff",
+                  color: "#4B2E83",
+                  borderRadius: 16,
+                  padding: "5px 12px",
+                  fontSize: 11.5,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 11, fontWeight: 800, color: "#8A8494", marginBottom: 8 }}>
+            PERMISSIONS
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 14 }}>
+            {PERMISSIONS.map((p) => (
+              <label
+                key={p.id}
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 9,
+                  padding: "7px 0",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!current[p.id]}
+                  onChange={() => togglePerm(p.id)}
+                  style={{ width: 16, height: 16, accentColor: "#4B2E83", marginTop: 1, flexShrink: 0 }}
+                />
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 600, display: "block" }}>{p.label}</span>
+                  <span style={{ fontSize: 11, color: "#A19DAF" }}>{p.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+
+          {confirmRemove ? (
+            <div
+              style={{
+                background: "#FDF0F0",
+                border: "1px solid #E8B4B4",
+                borderRadius: 8,
+                padding: 10,
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#8A2E2E", marginBottom: 8 }}>
+                Remove {member.name}'s access?
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => setConfirmRemove(false)}
+                  style={{
+                    flex: 1,
+                    background: "transparent",
+                    border: "1px solid #E0DCE8",
+                    borderRadius: 7,
+                    padding: "7px 0",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    color: "#565064",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => onRemove(member.id)}
+                  style={{
+                    flex: 1,
+                    background: "#B33A3A",
+                    border: "none",
+                    borderRadius: 7,
+                    padding: "7px 0",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    color: "#fff",
+                  }}
+                >
+                  Yes, remove
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmRemove(true)}
+              style={{
+                background: "transparent",
+                border: "1px solid #E8B4B4",
+                borderRadius: 7,
+                padding: "7px 12px",
+                fontSize: 11.5,
+                fontWeight: 700,
+                cursor: "pointer",
+                color: "#8A2E2E",
+              }}
+            >
+              Remove access
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NoAccessPanel({ theme, what }) {
+  return (
+    <div style={{ padding: 40, textAlign: "center" }}>
+      <div style={{ fontSize: 28, marginBottom: 10 }}>🔒</div>
+      <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 6, color: theme.text }}>
+        Not shared with you
+      </div>
+      <div style={{ fontSize: 13, color: theme.subtext, lineHeight: 1.5, maxWidth: 300, margin: "0 auto" }}>
+        You don't have access to {what} right now. If you think you should, ask the family admin to
+        update your permissions.
+      </div>
+    </div>
+  );
+}
+
 function EmptyLine({ text }) {
   return <div style={{ fontSize: 13.5, color: "#9A9A9A", fontStyle: "italic" }}>{text}</div>;
 }
@@ -4253,14 +5018,15 @@ function PhotoImg({ src, alt, style }) {
   return <img src={src} alt={alt || ""} style={style} onError={() => setBroken(true)} />;
 }
 
-function BottomNav({ theme, tab, setTab }) {
+function BottomNav({ theme, tab, setTab, perms }) {
+  const p = perms || {};
   const items = [
     { id: "home", label: "Home", icon: "🏠" },
-    { id: "events", label: "Events", icon: "📅" },
-    { id: "gallery", label: "Gallery", icon: "🖼️" },
-    { id: "party", label: "Party", icon: "🎉" },
-    { id: "submit", label: "Submit", icon: "📤" },
-  ];
+    { id: "events", label: "Events", icon: "📅", need: "viewEvents" },
+    { id: "gallery", label: "Gallery", icon: "🖼️", need: "viewGallery" },
+    { id: "party", label: "Party", icon: "🎉", need: "viewParty" },
+    { id: "submit", label: "Submit", icon: "📤", need: "submitPhotos" },
+  ].filter((it) => !it.need || p[it.need]);
   return (
     <div
       style={{
@@ -4309,7 +5075,7 @@ function BottomNav({ theme, tab, setTab }) {
    REMINDERS SETTINGS — manage phone numbers used for text reminders
    Shared across both kids since it's the same parents.
    ============================================================ */
-function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onSwitchMember }) {
+function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onSetPermissions, onSwitchMember }) {
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const [codeInput, setCodeInput] = useState(settings.accessCode || "");
@@ -4459,42 +5225,99 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
                               padding: "10px 12px",
                             }}
                           >
-                            <div style={{ fontSize: 13.5, fontWeight: 700 }}>{m.name}</div>
-                            <div style={{ fontSize: 12, color: "#8A8494", marginBottom: 8 }}>{m.email}</div>
-                            <div style={{ display: "flex", gap: 8 }}>
-                              <button
-                                onClick={() => onApproveMember(m.id)}
-                                style={{
-                                  flex: 1,
-                                  background: "#2E7D32",
-                                  color: "#fff",
-                                  border: "none",
-                                  borderRadius: 7,
-                                  padding: "8px 0",
-                                  fontSize: 12.5,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                }}
-                              >
-                                ✓ Approve
-                              </button>
-                              <button
-                                onClick={() => onDenyMember(m.id)}
-                                style={{
-                                  flex: 1,
-                                  background: "transparent",
-                                  color: "#8A2E2E",
-                                  border: "1.5px solid #E8B4B4",
-                                  borderRadius: 7,
-                                  padding: "8px 0",
-                                  fontSize: 12.5,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                }}
-                              >
-                                ✕ Deny
-                              </button>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                              {m.photo ? (
+                                <img
+                                  src={m.photo}
+                                  alt=""
+                                  style={{ width: 40, height: 40, borderRadius: "50%", objectFit: "cover" }}
+                                />
+                              ) : (
+                                <div
+                                  style={{
+                                    width: 40,
+                                    height: 40,
+                                    borderRadius: "50%",
+                                    background: "#F1EFF5",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    fontSize: 18,
+                                  }}
+                                >
+                                  👤
+                                </div>
+                              )}
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: 13.5, fontWeight: 700 }}>{m.name}</div>
+                                <div style={{ fontSize: 11.5, color: "#8A8494" }}>{m.email}</div>
+                              </div>
                             </div>
+                            <div style={{ fontSize: 12, color: "#5A5468", marginBottom: 8, lineHeight: 1.5 }}>
+                              {m.relationship && (
+                                <div>
+                                  <strong>Relationship:</strong> {m.relationship}
+                                </div>
+                              )}
+                              {m.phone && (
+                                <div>
+                                  <strong>Phone:</strong> {m.phone}
+                                </div>
+                              )}
+                              {m.kids && m.kids.length > 0 && (
+                                <div>
+                                  <strong>Here for:</strong> {m.kids.map((k) => THEMES[k].name).join(" & ")}
+                                </div>
+                              )}
+                              {m.note && (
+                                <div style={{ fontStyle: "italic", marginTop: 4 }}>“{m.note}”</div>
+                              )}
+                            </div>
+                            <div style={{ fontSize: 10.5, fontWeight: 800, color: "#7A5A1A", marginBottom: 6 }}>
+                              APPROVE AS
+                            </div>
+                            <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+                              {Object.entries(PERMISSION_PRESETS).map(([key, preset]) => (
+                                <button
+                                  key={key}
+                                  onClick={() => onApproveMember(m.id, key)}
+                                  title={preset.hint}
+                                  style={{
+                                    flex: "1 1 auto",
+                                    background: "#2E7D32",
+                                    color: "#fff",
+                                    border: "none",
+                                    borderRadius: 7,
+                                    padding: "8px 10px",
+                                    fontSize: 12,
+                                    fontWeight: 700,
+                                    cursor: "pointer",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  ✓ {preset.label}
+                                </button>
+                              ))}
+                            </div>
+                            <div style={{ fontSize: 10.5, color: "#8A8494", marginBottom: 8, lineHeight: 1.4 }}>
+                              You can fine-tune exactly what they see afterward.
+                            </div>
+                            <button
+                              onClick={() => onDenyMember(m.id)}
+                              style={{
+                                width: "100%",
+                                background: "transparent",
+                                color: "#8A2E2E",
+                                border: "1.5px solid #E8B4B4",
+                                borderRadius: 7,
+                                padding: "8px 0",
+                                fontSize: 12.5,
+                                fontWeight: 700,
+                                cursor: "pointer",
+                              }}
+                            >
+                              ✕ Deny
+                            </button>
                           </div>
                         ))}
                     </div>
@@ -4508,56 +5331,12 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
                   {members
                     .filter((m) => m.status === "approved")
                     .map((m) => (
-                      <div
+                      <MemberRow
                         key={m.id}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          border: "1px solid #EDEAF3",
-                          borderRadius: 9,
-                          padding: "9px 12px",
-                          gap: 8,
-                        }}
-                      >
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontSize: 13, fontWeight: 700 }}>
-                            {m.name}{" "}
-                            {m.role === "admin" && <span style={{ color: "#4B2E83", fontSize: 11 }}>★</span>}
-                          </div>
-                          <div
-                            style={{
-                              fontSize: 11.5,
-                              color: "#8A8494",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {m.email}
-                          </div>
-                        </div>
-                        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                          {m.role !== "admin" && (
-                            <button
-                              onClick={() => onRemoveMember(m.id)}
-                              title="Remove this person's access"
-                              style={{
-                                background: "transparent",
-                                border: "1px solid #E8B4B4",
-                                borderRadius: 6,
-                                padding: "5px 10px",
-                                fontSize: 11,
-                                fontWeight: 700,
-                                cursor: "pointer",
-                                color: "#8A2E2E",
-                              }}
-                            >
-                              Remove
-                            </button>
-                          )}
-                        </div>
-                      </div>
+                        member={m}
+                        onRemove={onRemoveMember}
+                        onSetPermissions={onSetPermissions}
+                      />
                     ))}
                 </div>
 
