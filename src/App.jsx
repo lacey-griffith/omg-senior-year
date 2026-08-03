@@ -9,7 +9,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
    still turn it on manually per-device via Settings, same as before.
    ============================================================ */
 const APP_CONFIG = {
-  syncUrl: "https://script.google.com/macros/s/AKfycbyxcKaqCOjBCGZgny8K9p9jX3CVzN13TPpes8ptL6ziEzZ6agqHhAV_MXruCyt6KOembQ/exec",
+  syncUrl: "https://script.google.com/macros/s/AKfycbzO-UAvxVYtl2GoBtRhlutGkMIKdih8HeaqzyKTSwr8FclVgSkBtdqaKmwvMc8UX38i7Q/exec",
   // Leave blank to use the family member request/approve flow.
   googleClientId: "",
   // Whoever signs in with this email is the admin — approves/denies requests
