@@ -10,8 +10,12 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
    ============================================================ */
 const APP_CONFIG = {
   syncUrl: "https://script.google.com/macros/s/AKfycbyxcKaqCOjBCGZgny8K9p9jX3CVzN13TPpes8ptL6ziEzZ6agqHhAV_MXruCyt6KOembQ/exec",
+  // Leave blank to use the family member request/approve flow.
   googleClientId: "",
-  adminEmail: "",
+  // Whoever signs in with this email is the admin — approves/denies requests
+  // and manages everyone else. Set here (not by who signs up first) so control
+  // can't be claimed by whoever happens to open the link first.
+  adminEmail: "lacey.griffith04@gmail.com",
 };
 
 /* ============================================================
@@ -579,21 +583,37 @@ export default function SeniorYearHub() {
   const settings = store.settings || { phoneNumbers: [], accessCode: "", deviceUnlocked: false, syncUrl: "", googleClientId: "", members: [] };
   const members = settings.members || [];
   const membersEnabled = !googleClientId; // member flow is the default when Google auth isn't set up
+  const adminEmail = (APP_CONFIG.adminEmail || "").trim().toLowerCase();
   const me = memberId ? members.find((m) => m.id === memberId) : null;
-  const isAdmin = !!(me && me.role === "admin");
+  // Admin is whoever matches the configured admin email — not whoever signed
+  // up first. That means control can't be claimed by a random early visitor,
+  // and it still works if the members list is ever wiped.
+  const isAdmin = !!(me && adminEmail && me.email.trim().toLowerCase() === adminEmail);
   const pendingCount = members.filter((m) => m.status === "pending").length;
 
   function requestAccess(name, email) {
+    const cleanName = name.trim();
+    const cleanEmail = email.trim();
+    const lower = cleanEmail.toLowerCase();
+
+    // Already known? Just re-attach this device to that record rather than
+    // creating a duplicate — handles new phones, cleared browsers, etc.
+    const existing = members.find((m) => m.email.trim().toLowerCase() === lower);
+    if (existing) {
+      saveMemberId(existing.id);
+      setMemberId(existing.id);
+      return;
+    }
+
     const id = "m" + Date.now() + Math.random().toString(36).slice(2, 7);
-    // The very first person to sign up becomes the admin automatically —
-    // that's you, since you'll set it up first.
-    const isFirst = members.length === 0;
+    const isTheAdmin = !!adminEmail && lower === adminEmail;
     const newMember = {
       id,
-      name: name.trim(),
-      email: email.trim(),
-      status: isFirst ? "approved" : "pending",
-      role: isFirst ? "admin" : "member",
+      name: cleanName,
+      email: cleanEmail,
+      // The admin never waits on anyone; everyone else needs approval.
+      status: isTheAdmin ? "approved" : "pending",
+      role: isTheAdmin ? "admin" : "member",
       requestedAt: new Date().toISOString(),
     };
     updateSettings((s) => ({ ...s, members: [...(s.members || []), newMember] }));
@@ -619,13 +639,6 @@ export default function SeniorYearHub() {
     updateSettings((s) => ({ ...s, members: (s.members || []).filter((m) => m.id !== id) }));
   }
 
-  function makeAdmin(id) {
-    updateSettings((s) => ({
-      ...s,
-      members: (s.members || []).map((m) => (m.id === id ? { ...m, role: "admin" } : m)),
-    }));
-  }
-
   function switchMember() {
     clearMemberId();
     setMemberId(null);
@@ -645,7 +658,7 @@ export default function SeniorYearHub() {
 
   // Member flow: introduce yourself, then wait for the admin to approve.
   if (membersEnabled && !me) {
-    return <RequestAccessGate onRequest={requestAccess} isFirst={members.length === 0} />;
+    return <RequestAccessGate onRequest={requestAccess} adminEmail={adminEmail} />;
   }
 
   if (membersEnabled && me && me.status === "pending") {
@@ -745,7 +758,7 @@ export default function SeniorYearHub() {
           onApproveMember={approveMember}
           onDenyMember={denyMember}
           onRemoveMember={removeMember}
-          onMakeAdmin={makeAdmin}
+
           onSwitchMember={switchMember}
         />
       )}
@@ -890,21 +903,23 @@ const GATE_INPUT_STYLE = {
   fontFamily: "inherit",
 };
 
-function RequestAccessGate({ onRequest, isFirst }) {
+function RequestAccessGate({ onRequest, adminEmail }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
 
   const ready = name.trim().length > 0 && email.trim().length > 0;
+  // Give the admin a heads-up that they'll go straight in, so it doesn't feel
+  // like they're about to wait on themselves.
+  const isAdminEmail = !!adminEmail && email.trim().toLowerCase() === adminEmail;
 
   return (
     <div style={GATE_WRAP_STYLE}>
       <div style={GATE_CARD_STYLE}>
-        <div style={{ fontSize: 30, marginBottom: 6 }}>{isFirst ? "👋" : "🔒"}</div>
+        <div style={{ fontSize: 30, marginBottom: 6 }}>🔒</div>
         <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Senior Year Hub</div>
         <div style={{ fontSize: 13, color: "#8A8494", marginBottom: 20, lineHeight: 1.5 }}>
-          {isFirst
-            ? "Welcome! You're the first one here, so you'll be set up as the admin — you'll approve everyone else who requests access."
-            : "This family hub is private. Tell us who you are and we'll send a request to the family admin for approval."}
+          This family hub is private. Enter your name and email to continue — if you've been here
+          before, you'll go right back in.
         </div>
 
         <input
@@ -939,11 +954,13 @@ function RequestAccessGate({ onRequest, isFirst }) {
             cursor: ready ? "pointer" : "not-allowed",
           }}
         >
-          {isFirst ? "Set up my hub" : "Request access"}
+          Continue
         </button>
 
         <div style={{ fontSize: 11, color: "#A19DAF", marginTop: 14, lineHeight: 1.5 }}>
-          No password needed — the admin approves each person by hand.
+          {isAdminEmail
+            ? "★ Admin account — you'll go straight in."
+            : "No password needed. New here? The family admin approves each person."}
         </div>
       </div>
     </div>
@@ -4292,7 +4309,7 @@ function BottomNav({ theme, tab, setTab }) {
    REMINDERS SETTINGS — manage phone numbers used for text reminders
    Shared across both kids since it's the same parents.
    ============================================================ */
-function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onMakeAdmin, onSwitchMember }) {
+function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus, lastSynced, googleAuth, onSignOut, me, isAdmin, members, membersEnabled, onApproveMember, onDenyMember, onRemoveMember, onSwitchMember }) {
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const [codeInput, setCodeInput] = useState(settings.accessCode || "");
@@ -4382,7 +4399,7 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
             </div>
             <div style={{ fontSize: 12.5, color: "#8A8494", marginBottom: 12, lineHeight: 1.5 }}>
               {isAdmin
-                ? "You're the admin. New people who open the hub request access here, and they can't see anything until you approve them."
+                ? "You're the admin. Anyone new who opens the hub lands in the queue below and can't see anything until you approve them."
                 : "You're signed in as a family member. Only the admin can approve new people."}
             </div>
 
@@ -4522,40 +4539,22 @@ function RemindersSettingsModal({ settings, updateSettings, onClose, syncStatus,
                         </div>
                         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                           {m.role !== "admin" && (
-                            <>
-                              <button
-                                onClick={() => onMakeAdmin(m.id)}
-                                title="Make admin"
-                                style={{
-                                  background: "transparent",
-                                  border: "1px solid #E0DCE8",
-                                  borderRadius: 6,
-                                  padding: "5px 8px",
-                                  fontSize: 11,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                  color: "#4B2E83",
-                                }}
-                              >
-                                ★
-                              </button>
-                              <button
-                                onClick={() => onRemoveMember(m.id)}
-                                title="Remove"
-                                style={{
-                                  background: "transparent",
-                                  border: "1px solid #E8B4B4",
-                                  borderRadius: 6,
-                                  padding: "5px 8px",
-                                  fontSize: 11,
-                                  fontWeight: 700,
-                                  cursor: "pointer",
-                                  color: "#8A2E2E",
-                                }}
-                              >
-                                ✕
-                              </button>
-                            </>
+                            <button
+                              onClick={() => onRemoveMember(m.id)}
+                              title="Remove this person's access"
+                              style={{
+                                background: "transparent",
+                                border: "1px solid #E8B4B4",
+                                borderRadius: 6,
+                                padding: "5px 10px",
+                                fontSize: 11,
+                                fontWeight: 700,
+                                cursor: "pointer",
+                                color: "#8A2E2E",
+                              }}
+                            >
+                              Remove
+                            </button>
                           )}
                         </div>
                       </div>
