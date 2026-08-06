@@ -3557,36 +3557,6 @@ function GalleryTab({ store, visibleKids, updateKidData, perms, currentUser, set
   const [openDetailConfirming, setOpenDetailConfirming] = useState(false);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
   const [driveNote, setDriveNote] = useState("");
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState(null);
-
-  async function testConnection() {
-    const url = (settings && settings.syncUrl) || "";
-    if (!url) {
-      setTestResult({ ok: false, msg: "No sync URL is set in the app config." });
-      return;
-    }
-    setTesting(true);
-    setTestResult(null);
-    try {
-      const data = await fetchRemoteStore(url);
-      const memberCount = ((data && data.settings && data.settings.members) || []).length;
-      setTestResult({
-        ok: true,
-        msg: `✓ Connected. The shared file currently has ${memberCount} member record${memberCount === 1 ? "" : "s"}.`,
-      });
-    } catch (err) {
-      setTestResult({
-        ok: false,
-        msg:
-          "✕ Couldn't reach it: " +
-          (err && err.message ? err.message : "unknown error") +
-          ". Check that the Apps Script deployment is live and set to \"Anyone\" access.",
-      });
-    } finally {
-      setTesting(false);
-    }
-  }
 
   const syncUrl = (settings && settings.syncUrl) || "";
   const canModerate = perms.approvePhotos;
@@ -5369,6 +5339,36 @@ function AdminPage({
 }) {
   const [section, setSection] = useState("review");
   const [driveNote, setDriveNote] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null);
+
+  async function testConnection() {
+    const url = (settings && settings.syncUrl) || "";
+    if (!url) {
+      setTestResult({ ok: false, msg: "No sync URL is set in the app config." });
+      return;
+    }
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const data = await fetchRemoteStore(url);
+      const memberCount = ((data && data.settings && data.settings.members) || []).length;
+      setTestResult({
+        ok: true,
+        msg: `✓ Connected. The shared file currently has ${memberCount} member record${memberCount === 1 ? "" : "s"}.`,
+      });
+    } catch (err) {
+      setTestResult({
+        ok: false,
+        msg:
+          "✕ Couldn't reach it: " +
+          (err && err.message ? err.message : "unknown error") +
+          ". Check that the Apps Script deployment is live and set to \"Anyone\" access.",
+      });
+    } finally {
+      setTesting(false);
+    }
+  }
   const [label, setLabel] = useState("");
   const [number, setNumber] = useState("");
   const phoneNumbers = settings.phoneNumbers || [];
